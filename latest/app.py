@@ -845,21 +845,58 @@ HTML_TEMPLATE = """
             document.getElementById('inspector-modal').style.display = 'none';
         }
 
+        function escapeHtml(str) {
+            if (str === null || str === undefined) return '';
+            return String(str)
+                .replace(/&/g, '&amp;')
+                .replace(/</g, '&lt;')
+                .replace(/>/g, '&gt;')
+                .replace(/"/g, '&quot;')
+                .replace(/'/g, '&#39;');
+        }
+
+        function sanitizeIp(str) {
+            if (!str) return '';
+            return String(str).replace(/[^0-9a-zA-Z.:_-]/g, '');
+        }
+
         async function executeRealBlock(targetIp) {
-            const res = await fetch(`/api/execute_real_block?ip=${targetIp}`);
-            const data = await res.json();
-            alert(`[ADMIN FIREWALL RESPONSE]:\n${data.message || data.status}`);
+            const clean = sanitizeIp(targetIp);
+            try {
+                const res = await fetch(`/api/execute_real_block?ip=${encodeURIComponent(clean)}`);
+                const data = await res.json();
+                if (!res.ok) {
+                    alert(`[FIREWALL ACTION ERROR ${res.status}]:\n${data.message || 'Block action failed'}`);
+                    return;
+                }
+                alert(`[ADMIN FIREWALL RESPONSE]:\n${data.message || data.status}`);
+            } catch (err) {
+                alert(`[FIREWALL NETWORK FAILURE]:\nUnable to reach server: ${err.message}`);
+            }
         }
 
         async function unblockIp(targetIp) {
-            const res = await fetch(`/api/unblock_ip?ip=${targetIp}`);
-            const data = await res.json();
-            alert(`[ADMIN UNBLOCK RESULT]:\n${data.message || data.status}`);
+            const clean = sanitizeIp(targetIp);
+            try {
+                const res = await fetch(`/api/unblock_ip?ip=${encodeURIComponent(clean)}`);
+                const data = await res.json();
+                if (!res.ok) {
+                    alert(`[FIREWALL UNBLOCK ERROR ${res.status}]:\n${data.message || 'Unblock action failed'}`);
+                    return;
+                }
+                alert(`[ADMIN UNBLOCK RESULT]:\n${data.message || data.status}`);
+            } catch (err) {
+                alert(`[UNBLOCK NETWORK FAILURE]:\nUnable to reach server: ${err.message}`);
+            }
         }
 
         async function updateDeviceAccessSection() {
             try {
                 const res = await fetch('/api/device_requests');
+                if (!res.ok) {
+                    console.warn(`Device requests fetch failed: HTTP ${res.status}`);
+                    return;
+                }
                 const data = await res.json();
                 const authContainer = document.getElementById('auth-device-list');
                 const pendContainer = document.getElementById('pending-device-list');
@@ -871,16 +908,18 @@ HTML_TEMPLATE = """
                 if (data.authorized_devices && data.authorized_devices.length > 0) {
                     data.authorized_devices.forEach(dev => {
                         let actionHtml = '';
+                        const safeDevId = escapeHtml(dev.device_id || '');
+                        const safeIp = escapeHtml(dev.client_ip || '');
                         if (dev.is_server) {
                             actionHtml = '<span style="color:var(--neon-cyan); font-size:8px; font-weight:700;">SERVER</span>';
                         } else if (isAdmin) {
-                            actionHtml = `<button class="cyber-btn" style="padding:2px 6px; font-size:8px; background:var(--critical-crimson); color:white; width:auto; margin:0;" onclick="revokeDevice('${dev.device_id}')">REVOKE</button>`;
+                            actionHtml = `<button class="cyber-btn" style="padding:2px 6px; font-size:8px; background:var(--critical-crimson); color:white; width:auto; margin:0;" onclick="revokeDevice('${safeDevId}')">REVOKE</button>`;
                         }
-                        const devLabel = dev.is_server ? 'CyberGraph Server' : (dev.device_name || 'Approved Device');
+                        const devLabel = escapeHtml(dev.is_server ? 'CyberGraph Server' : (dev.device_name || 'Approved Device'));
                         authHtml += `
                             <div style="display:flex; justify-content:space-between; align-items:center; padding:3px 0; border-bottom:1px solid rgba(255,255,255,0.05);">
                                 <div>
-                                    <span style="color:var(--emerald-green); font-weight:700;">${dev.client_ip}</span>
+                                    <span style="color:var(--emerald-green); font-weight:700;">${safeIp}</span>
                                     <span style="color:var(--text-muted); font-size:8px;"> (${devLabel})</span>
                                 </div>
                                 <div>
@@ -898,13 +937,15 @@ HTML_TEMPLATE = """
                 if (data.pending_requests && data.pending_requests.length > 0) {
                     data.pending_requests.forEach(req => {
                         let actionHtml = '';
+                        const safeReqId = escapeHtml(req.request_id || '');
+                        const safeIp = escapeHtml(req.client_ip || '');
                         if (isAdmin) {
-                            actionHtml = `<button class="cyber-btn" style="padding:2px 6px; font-size:8px; background:var(--emerald-green); color:black; width:auto; margin:0;" onclick="approveDevice('${req.request_id}')">APPROVE</button>`;
+                            actionHtml = `<button class="cyber-btn" style="padding:2px 6px; font-size:8px; background:var(--emerald-green); color:black; width:auto; margin:0;" onclick="approveDevice('${safeReqId}')">APPROVE</button>`;
                         }
                         pendHtml += `
                             <div style="display:flex; justify-content:space-between; align-items:center; padding:4px 0; border-bottom:1px solid rgba(255,255,255,0.05);">
                                 <div>
-                                    <span style="color:var(--warning-amber); font-weight:700;">${req.client_ip}</span>
+                                    <span style="color:var(--warning-amber); font-weight:700;">${safeIp}</span>
                                     <span style="color:var(--text-muted); font-size:8px;"> PENDING</span>
                                 </div>
                                 <div>
@@ -923,21 +964,60 @@ HTML_TEMPLATE = """
         }
 
         async function approveDevice(reqId) {
-            await fetch(`/api/approve_device?request_id=${reqId}`, {method: 'POST'});
+            try {
+                const res = await fetch(`/api/approve_device?request_id=${encodeURIComponent(reqId)}`, {method: 'POST'});
+                if (!res.ok) console.warn(`Approve device returned HTTP ${res.status}`);
+            } catch(e) {
+                console.error("Approve device error", e);
+            }
             updateDeviceAccessSection();
             fetchStreamStep();
         }
 
         async function revokeDevice(devId) {
-            await fetch(`/api/revoke_device?device_id=${devId}`, {method: 'POST'});
+            try {
+                const res = await fetch(`/api/revoke_device?device_id=${encodeURIComponent(devId)}`, {method: 'POST'});
+                if (!res.ok) console.warn(`Revoke device returned HTTP ${res.status}`);
+            } catch(e) {
+                console.error("Revoke device error", e);
+            }
             updateDeviceAccessSection();
             fetchStreamStep();
         }
 
+        let isPolling = false;
+        let lastDeviceStateVersion = -1;
+        let lastDevicePollTime = 0;
+
         async function fetchStreamStep() {
-            const res = await fetch('/api/stream_step');
-            const data = await res.json();
-            updateDeviceAccessSection();
+            if (isPolling) return;
+            isPolling = true;
+
+            let data;
+            try {
+                const res = await fetch('/api/stream_step');
+                if (!res.ok) {
+                    console.warn(`Stream step HTTP ${res.status}`);
+                    return;
+                }
+                data = await res.json();
+            } catch(e) {
+                console.error("Stream step network error:", e);
+                return;
+            } finally {
+                isPolling = false;
+            }
+
+            if (!data || !data.stats) return;
+
+            // Avoid unnecessary repeated device-access calls:
+            // Only update device section if state_version changed or periodically after 10s
+            const nowTime = Date.now();
+            if (data.state_version !== lastDeviceStateVersion || (nowTime - lastDevicePollTime) > 10000) {
+                lastDeviceStateVersion = data.state_version;
+                lastDevicePollTime = nowTime;
+                updateDeviceAccessSection();
+            }
 
             if (data.state_version) {
                 document.getElementById('version-tag').innerText = `STATE V: ${data.state_version}`;
@@ -1021,13 +1101,20 @@ HTML_TEMPLATE = """
                 const card = document.createElement('div');
                 card.className = `threat-card ${isNormal ? 'lvl-1' : (ev.level.includes('Level 2') ? 'lvl-2' : 'lvl-3')}`;
 
+                const safeLvl = escapeHtml(ev.level || 'Unknown');
+                const safeBadge = escapeHtml(ev.badge_color || '#10b981');
+                const safeSrc = escapeHtml(ev.source_host || '-');
+                const safeDst = escapeHtml(ev.target_service || '-');
+                const safeSummary = escapeHtml(ev.summary || '');
+                const safeRisk = Number(ev.risk_score || 0).toFixed(4);
+
                 let html = `
-                    <div style="display:flex; justify-space-between; margin-bottom:4px;">
-                        <strong>${ev.level}</strong>
-                        <span style="background:${ev.badge_color}; color:#000; padding:2px 6px; border-radius:4px; font-weight:700;">Risk: ${ev.risk_score.toFixed(4)}</span>
+                    <div style="display:flex; justify-content:space-between; margin-bottom:4px;">
+                        <strong>${safeLvl}</strong>
+                        <span style="background:${safeBadge}; color:#000; padding:2px 6px; border-radius:4px; font-weight:700;">Risk: ${safeRisk}</span>
                     </div>
-                    <div><strong>Src:</strong> ${ev.source_host} &rarr; <strong>Dst:</strong> ${ev.target_service}</div>
-                    <div style="margin-top:4px; color:var(--text-muted);">${ev.summary}</div>
+                    <div><strong>Src:</strong> ${safeSrc} &rarr; <strong>Dst:</strong> ${safeDst}</div>
+                    <div style="margin-top:4px; color:var(--text-muted);">${safeSummary}</div>
                 `;
 
                 if (!isNormal && ev.xai_explanation && ev.xai_explanation.why_this_attack_reasons) {
@@ -1035,27 +1122,36 @@ HTML_TEMPLATE = """
                     html += `
                         <div class="why-attack-box">
                             <div class="why-title">WHY THIS ATTACK? (SHAP & SALIENCY)</div>
-                            ${reasons.map(r => `<div>${r}</div>`).join('')}
+                            ${reasons.map(r => `<div>${escapeHtml(r)}</div>`).join('')}
                         </div>
                     `;
                 }
 
                 if (!isNormal && ev.bipartite_attack_chain) {
-                    html += `<div style="margin-top:6px; font-family:'JetBrains Mono'; font-size:10px; color:#ff99bb;"><strong>Attack Chain:</strong><br>${ev.bipartite_attack_chain.join(' &rarr; ')}</div>`;
+                    const safeChain = ev.bipartite_attack_chain.map(c => escapeHtml(c)).join(' &rarr; ');
+                    html += `<div style="margin-top:6px; font-family:'JetBrains Mono'; font-size:10px; color:#ff99bb;"><strong>Attack Chain:</strong><br>${safeChain}</div>`;
                 }
 
                 if (!isNormal && ev.mitre_mappings && ev.mitre_mappings.length > 0) {
                     html += `<div class="mitre-section">`;
                     html += `<div style="color:var(--mitre-blue); font-weight:700; margin-bottom:4px;">MITRE ATT&CK Techniques Detected:</div>`;
                     ev.mitre_mappings.forEach(m => {
+                        const safeTechId = escapeHtml(m.technique_id || '');
+                        const safeTechName = escapeHtml(m.technique_name || '');
+                        const safeConf = (Number(m.confidence || 0) * 100).toFixed(1);
+                        const safeRationale = escapeHtml(m.rationale || '');
+                        const safeTactic = escapeHtml(m.tactic || '');
+
                         html += `<div style="margin:4px 0;">`;
-                        html += `<span class="mitre-badge">${m.technique_id}</span> `;
-                        html += `<span style="color:var(--text-main);">${m.technique_name}</span> `;
-                        html += `<span class="mitre-confidence">${(m.confidence*100).toFixed(1)}%</span>`;
+                        html += `<span class="mitre-badge">${safeTechId}</span> `;
+                        html += `<span style="color:var(--text-main);">${safeTechName}</span> `;
+                        html += `<span class="mitre-confidence">${safeConf}%</span>`;
                         html += `</div>`;
-                        html += `<div class="mitre-rationale">${m.rationale || ''}</div>`;
-                        if (m.tactic) {
-                            html += `<div style="color:var(--text-muted); font-size:8px;">Tactic: ${m.tactic}</div>`;
+                        if (safeRationale) {
+                            html += `<div class="mitre-rationale">${safeRationale}</div>`;
+                        }
+                        if (safeTactic) {
+                            html += `<div style="color:var(--text-muted); font-size:8px;">Tactic: ${safeTactic}</div>`;
                         }
                     });
                     html += `</div>`;
@@ -1063,11 +1159,12 @@ HTML_TEMPLATE = """
 
                 if (!isNormal && ev.recommended_firewall_action) {
                     const fw = ev.recommended_firewall_action;
-                    const ipClean = fw.target_ip;
+                    const ipClean = sanitizeIp(fw.target_ip || '');
+                    const safePreview = escapeHtml(fw.windows_netsh_rule_preview || '');
                     html += `
                         <div style="margin-top:8px;">
                             <strong style="color:var(--critical-crimson);">Recommended Block Action (Simulated Response):</strong>
-                            <div class="cmd-box">${fw.windows_netsh_rule_preview}</div>
+                            <div class="cmd-box">${safePreview}</div>
                             <button class="cyber-btn real-fw-btn" onclick="executeRealBlock('${ipClean}')">Admin Approval: Execute Real OS Firewall Rule</button>
                             <button class="cyber-btn unblock-btn" onclick="unblockIp('${ipClean}')">Admin Action: Unblock IP</button>
                         </div>
@@ -1177,8 +1274,16 @@ HTML_TEMPLATE = """
             fetchStreamStep();
         });
 
-        fetchStreamStep();
-        setInterval(fetchStreamStep, 750);
+        function scheduleNextPoll() {
+            setTimeout(async () => {
+                await fetchStreamStep();
+                scheduleNextPoll();
+            }, 750);
+        }
+
+        fetchStreamStep().finally(() => {
+            scheduleNextPoll();
+        });
     </script>
 </body>
 </html>
