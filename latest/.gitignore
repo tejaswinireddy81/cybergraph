@@ -1,0 +1,112 @@
+# ==============================
+# Python
+# ==============================
+
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Pytest
+.pytest_cache/
+
+# ==============================
+# Virtual Environments / Secrets
+# ==============================
+
+.env
+.env.*
+!.env.example
+
+venv/
+.venv/
+env/
+ENV/
+
+# ==============================
+# IDE
+# ==============================
+
+.vscode/
+.idea/
+
+# ==============================
+# Jupyter
+# ==============================
+
+.ipynb_checkpoints/
+
+# ==============================
+# Datasets
+# ==============================
+
+NF-UNSW-NB15-v3.csv
+*.zip
+
+# ==============================
+# Trained Models / Model Artifacts
+# ==============================
+
+models/*.pkl
+models/*.keras
+models/*.pt
+models/*.pth
+models/*.h5
+models/*.onnx
+models/*.joblib
+models/*.json
+
+# Generic model binaries
+*.pkl
+*.keras
+*.pt
+*.pth
+*.h5
+*.onnx
+*.joblib
+
+# ML experiment artifacts
+checkpoints/
+runs/
+wandb/
+mlruns/
+
+# ==============================
+# Logs
+# ==============================
+
+logs/
+research_logs/
+
+*.log
+*.jsonl
+
+# ==============================
+# Generated Outputs
+# ==============================
+
+outputs/
+
+# ==============================
+# Temporary Files
+# ==============================
+
+*.tmp
+*.temp
+*.bak
+
+# ==============================
+# OS
+# ==============================
+
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Local SQLite databases
+data/*.db
+data/*.sqlite
+data/*.sqlite3
+
+# Temporary backup files
+*.backup_*
+*.backup-*

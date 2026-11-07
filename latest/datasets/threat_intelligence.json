@@ -1,0 +1,13 @@
+{
+    "185.220.101.1": {
+        "status": "Malicious",
+        "category": "Botnet",
+        "confidence": "High"
+    },
+
+    "192.168.1.250": {
+        "status": "Suspicious",
+        "category": "Port Scanner",
+        "confidence": "Medium"
+    }
+}

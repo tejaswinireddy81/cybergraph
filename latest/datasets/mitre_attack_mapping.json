@@ -1,0 +1,149 @@
+{
+  "version": "1.1",
+  "description": "Evidence-based MITRE ATT&CK technique mappings for CyberGraph. Only techniques supported by available network telemetry are included. T1059 is documented but disabled because network-flow telemetry does not directly observe command or script execution.",
+  "supported_techniques": {
+    "T1046": {
+      "technique_id": "T1046",
+      "technique_name": "Network Service Discovery",
+      "tactic": "Discovery",
+      "description": "Adversaries scan for service configurations to identify exposed services and potential attack vectors.",
+      "behavioral_indicators": {
+        "port_diversity": 0.3,
+        "connection_count": 0.25,
+        "short_durations": 0.2,
+        "service_probing": 0.25
+      },
+      "required_confidence_threshold": 0.7,
+      "evidence_weights": {
+        "port_diversity": 0.3,
+        "connection_count": 0.3,
+        "short_durations": 0.2,
+        "service_probing": 0.2
+      },
+      "supported_evidence": [
+        "High destination-port diversity from same source",
+        "Multiple short-lived connections to different services",
+        "Repeated connection attempts from same source IP",
+        "Service probing patterns in short time window"
+      ]
+    },
+    "T1110": {
+      "technique_id": "T1110",
+      "technique_name": "Brute Force",
+      "tactic": "Credential Access",
+      "description": "Adversaries attempt multiple login combinations to guess passwords.",
+      "behavioral_indicators": {
+        "repeated_connections": 0.4,
+        "auth_patterns": 0.3,
+        "rate_intensity": 0.3
+      },
+      "required_confidence_threshold": 0.65,
+      "evidence_weights": {
+        "repeated_connections": 0.4,
+        "auth_patterns": 0.3,
+        "rate_intensity": 0.3
+      },
+      "supported_evidence": [
+        "Repeated authentication attempts from same source",
+        "High connection rate to authentication services",
+        "Multiple login attempts to same target"
+      ]
+    },
+    "T1498": {
+      "technique_id": "T1498",
+      "technique_name": "Network Denial of Service",
+      "tactic": "Impact",
+      "description": "Adversaries disrupt network services by overwhelming targets with traffic.",
+      "behavioral_indicators": {
+        "volume_burst": 0.4,
+        "connection_rate": 0.35,
+        "duration_intensity": 0.25
+      },
+      "required_confidence_threshold": 0.75,
+      "evidence_weights": {
+        "volume_burst": 0.4,
+        "connection_rate": 0.35,
+        "duration_intensity": 0.25
+      },
+      "supported_evidence": [
+        "Sudden traffic volume increase",
+        "High connection rate to single target",
+        "Sustained high traffic volume"
+      ]
+    }
+  },
+  "unsupported_techniques": {
+    "T1059": {
+      "technique_name": "Command and Scripting Interpreter",
+      "reason": "No command or script execution evidence available in network flow telemetry. Port/protocol anomalies alone do not constitute evidence of command execution."
+    },
+    "T1078": {
+      "technique_name": "Valid Accounts",
+      "reason": "No credential validation evidence available in network flow telemetry"
+    },
+    "T1098": {
+      "technique_name": "Account Manipulation",
+      "reason": "No account management evidence available in network flow telemetry"
+    },
+    "T1021": {
+      "technique_name": "Remote Services",
+      "reason": "No lateral movement evidence available without host-level telemetry"
+    },
+    "T1087": {
+      "technique_name": "Account Discovery",
+      "reason": "No account enumeration evidence available in network flow telemetry"
+    },
+    "T1083": {
+      "technique_name": "File and Directory Discovery",
+      "reason": "No file system access evidence available in network flow telemetry"
+    },
+    "T1041": {
+      "technique_name": "Exfiltration Over C2 Channel",
+      "reason": "No C2 channel identification available without additional context"
+    },
+    "T1048": {
+      "technique_name": "Exfiltration Over Alternative Protocol",
+      "reason": "No protocol-based exfiltration evidence available"
+    },
+    "T1566": {
+      "technique_name": "Phishing",
+      "reason": "No email/web-based delivery evidence available in network flow telemetry"
+    },
+    "T1105": {
+      "technique_name": "Ingress Tool Transfer",
+      "reason": "No file transfer evidence available without payload inspection"
+    },
+    "T1193": {
+      "technique_name": "Spearphishing Attachment",
+      "reason": "No email attachment evidence available in network flow telemetry"
+    },
+    "T1195": {
+      "technique_name": "Supply Chain Compromise",
+      "reason": "No supply chain evidence available in network flow telemetry"
+    },
+    "T1218": {
+      "technique_name": "System Binary Proxy Execution",
+      "reason": "No binary execution evidence available without host-level telemetry"
+    },
+    "T1129": {
+      "technique_name": "Shared Tunneling",
+      "reason": "No tunneling evidence available in network flow telemetry"
+    },
+    "T1071": {
+      "technique_name": "Application Layer Protocol",
+      "reason": "No application-layer protocol evidence available without payload inspection"
+    },
+    "T1571": {
+      "technique_name": "Non-Standard Port",
+      "reason": "No port-based exfiltration evidence available"
+    },
+    "T1090": {
+      "technique_name": "Proxy",
+      "reason": "No proxy usage evidence available in network flow telemetry"
+    },
+    "T1029": {
+      "technique_name": "Scheduled Transfer",
+      "reason": "No scheduled task evidence available without host-level telemetry"
+    }
+  }
+}

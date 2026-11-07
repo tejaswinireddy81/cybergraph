@@ -1,0 +1,47 @@
+body{
+    background:#0d1117;
+    color:#ffffff;
+    font-family:Segoe UI,Arial,sans-serif;
+}
+
+h1,h2,h3,h4{
+    color:#58a6ff;
+}
+
+.card{
+    background:#161b22;
+    border-radius:12px;
+    padding:15px;
+    margin:10px;
+    box-shadow:0 0 10px rgba(0,0,0,.4);
+    border:1px solid #30363d;
+}
+
+.good{
+    color:#2ecc71;
+}
+
+.medium{
+    color:#f1c40f;
+}
+
+.bad{
+    color:#e74c3c;
+}
+
+.section-title{
+    font-size:22px;
+    font-weight:bold;
+    margin-top:20px;
+    margin-bottom:10px;
+    color:#58a6ff;
+}
+
+.dash-table-container{
+    border-radius:10px;
+    overflow:hidden;
+}
+
+.js-plotly-plot{
+    border-radius:12px;
+}
