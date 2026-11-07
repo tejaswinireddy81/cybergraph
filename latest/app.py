@@ -479,8 +479,9 @@ HTML_TEMPLATE = """
                     <div style="padding:4px;">Awaiting detection events...</div>
                 </div>
 
-                <button class="cyber-btn" id="btn-normal" style="background: linear-gradient(135deg, var(--emerald-green), #047857); color: #000;">Stream Normal Traffic</button>
-                <button class="cyber-btn attack-btn" id="btn-attack">Replay Attack Scenario</button>
+                <button class="cyber-btn" id="btn-normal" style="background: linear-gradient(135deg, var(--emerald-green), #047857); color: #000;">Live Wi-Fi (Auto-Detect)</button>
+                <button class="cyber-btn" id="btn-offline" style="background: linear-gradient(135deg, #0284c7, #0369a1); color: #fff; margin-top: 6px;">Stream Offline Dataset</button>
+                <button class="cyber-btn attack-btn" id="btn-attack" style="margin-top: 6px;">Replay Attack Scenario</button>
 
                 <div class="panel-heading" style="margin-top: 10px;">
                     <span class="panel-title"><div class="title-accent" style="background: var(--warning-amber);"></div> Risk Score Trend over Time</span>
@@ -1054,12 +1055,22 @@ HTML_TEMPLATE = """
                 document.getElementById('cap-buf').innerText = `${data.stats.live_buffer_count} Packets`;
             }
 
+            const btnAtk = document.getElementById('btn-attack');
+            const btnNorm = document.getElementById('btn-normal');
+            const btnOff = document.getElementById('btn-offline');
+
             if (data.mode === 'attack') {
-                document.getElementById('btn-attack').style.boxShadow = '0 0 15px rgba(255, 0, 85, 0.6)';
-                document.getElementById('btn-normal').style.boxShadow = 'none';
+                if (btnAtk) btnAtk.style.boxShadow = '0 0 15px rgba(255, 0, 85, 0.6)';
+                if (btnNorm) btnNorm.style.boxShadow = 'none';
+                if (btnOff) btnOff.style.boxShadow = 'none';
+            } else if (data.mode === 'offline') {
+                if (btnOff) btnOff.style.boxShadow = '0 0 15px rgba(14, 165, 233, 0.8)';
+                if (btnNorm) btnNorm.style.boxShadow = 'none';
+                if (btnAtk) btnAtk.style.boxShadow = 'none';
             } else {
-                document.getElementById('btn-normal').style.boxShadow = '0 0 15px rgba(0, 255, 157, 0.6)';
-                document.getElementById('btn-attack').style.boxShadow = 'none';
+                if (btnNorm) btnNorm.style.boxShadow = '0 0 15px rgba(0, 255, 157, 0.6)';
+                if (btnAtk) btnAtk.style.boxShadow = 'none';
+                if (btnOff) btnOff.style.boxShadow = 'none';
             }
 
             if (data.stats.current_data_source.includes('LIVE')) {
@@ -1282,11 +1293,18 @@ HTML_TEMPLATE = """
 
         document.getElementById('btn-normal').addEventListener('click', async () => {
             await fetch('/api/set_mode?mode=normal');
-            fetchStreamStep();
+            await fetchStreamStep();
         });
+        const btnOfflineEl = document.getElementById('btn-offline');
+        if (btnOfflineEl) {
+            btnOfflineEl.addEventListener('click', async () => {
+                await fetch('/api/set_mode?mode=offline');
+                await fetchStreamStep();
+            });
+        }
         document.getElementById('btn-attack').addEventListener('click', async () => {
             await fetch('/api/set_mode?mode=attack');
-            fetchStreamStep();
+            await fetchStreamStep();
         });
 
         function scheduleNextPoll() {
@@ -2348,7 +2366,7 @@ def _run_pipeline_cycle(batch_override=None):
     sync_network_state()
 
     capture_available = is_live_capture_available()
-    recent_live = get_recent_live_flows(window_seconds=10.0)
+    recent_live = get_recent_live_flows(window_seconds=3.0)
     has_recent_live = len(recent_live) > 0
 
     if batch_override is not None:
@@ -2988,6 +3006,10 @@ def set_mode():
         shared_state["state_version"] += 1
         v = shared_state["state_version"]
     logger.info(f"[GLOBAL MODE CHANGE] Server mode set to '{m}' (state_version={v})")
+    try:
+        _run_pipeline_cycle()
+    except Exception as exc:
+        logger.warning(f"Immediate cycle execution warning on mode change: {exc}")
     return jsonify({"status": "SUCCESS", "mode": m, "state_version": v})
 
 
