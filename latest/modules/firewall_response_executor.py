@@ -15,6 +15,7 @@ import os
 import sys
 import platform
 import subprocess
+import time
 import logging
 
 logger = logging.getLogger(__name__)
@@ -28,6 +29,7 @@ class FirewallResponseExecutor:
         self.os_type = platform.system().lower()
         self.simulated_acl_blocked_ips = set()
         self.active_os_firewall_rules = {}
+        self.action_history = []
 
     def generate_rule_preview(self, ip_address, port=None):
         """Generates cross-platform OS firewall block command preview strings."""
@@ -71,7 +73,7 @@ class FirewallResponseExecutor:
 
         if not should_execute_real:
             self.simulated_acl_blocked_ips.add(ip_address)
-            return {
+            res = {
                 "status": "SIMULATED_BLOCK_RECORDED",
                 "execution_mode": "SIMULATED_MEMORY_ONLY",
                 "ip_address": ip_address,
@@ -79,6 +81,15 @@ class FirewallResponseExecutor:
                 "command_preview": preview["block_command_preview"],
                 "verification": self.verify_blocked(ip_address),
             }
+            self.action_history.append({
+                "action": "BLOCK",
+                "ip": ip_address,
+                "port": port,
+                "execution_mode": res["execution_mode"],
+                "status": res["status"],
+                "timestamp": time.time(),
+            })
+            return res
 
         # Real OS Firewall Command Execution
         try:
@@ -90,7 +101,7 @@ class FirewallResponseExecutor:
             if res.returncode == 0:
                 self.active_os_firewall_rules[ip_address] = preview["unblock_command_preview"]
                 self.simulated_acl_blocked_ips.add(ip_address)
-                return {
+                ret = {
                     "status": "REAL_FIREWALL_RULE_APPLIED",
                     "execution_mode": "REAL_OS_FIREWALL",
                     "ip_address": ip_address,
@@ -108,7 +119,7 @@ class FirewallResponseExecutor:
                 if res_ps.returncode == 0:
                     self.active_os_firewall_rules[ip_address] = preview["unblock_command_preview"]
                     self.simulated_acl_blocked_ips.add(ip_address)
-                    return {
+                    ret = {
                         "status": "REAL_FIREWALL_RULE_APPLIED",
                         "execution_mode": "REAL_OS_FIREWALL_ELEVATED",
                         "ip_address": ip_address,
@@ -118,7 +129,7 @@ class FirewallResponseExecutor:
                     }
                 else:
                     self.simulated_acl_blocked_ips.add(ip_address)
-                    return {
+                    ret = {
                         "status": "ADMIN_PRIVILEGE_REQUIRED",
                         "execution_mode": "SIMULATED_MEMORY_ACTIVE",
                         "ip_address": ip_address,
@@ -128,7 +139,7 @@ class FirewallResponseExecutor:
                     }
             else:
                 self.simulated_acl_blocked_ips.add(ip_address)
-                return {
+                ret = {
                     "status": "ADMIN_PRIVILEGE_REQUIRED",
                     "execution_mode": "SIMULATED_MEMORY_ACTIVE",
                     "ip_address": ip_address,
@@ -139,7 +150,7 @@ class FirewallResponseExecutor:
                 }
         except Exception as e:
             self.simulated_acl_blocked_ips.add(ip_address)
-            return {
+            ret = {
                 "status": "ADMIN_PRIVILEGE_REQUIRED",
                 "execution_mode": "SIMULATED_MEMORY_ACTIVE",
                 "ip_address": ip_address,
@@ -147,6 +158,16 @@ class FirewallResponseExecutor:
                 "error": str(e),
                 "verification": self.verify_blocked(ip_address),
             }
+
+        self.action_history.append({
+            "action": "BLOCK",
+            "ip": ip_address,
+            "port": port,
+            "execution_mode": ret.get("execution_mode", "UNKNOWN"),
+            "status": ret.get("status", "UNKNOWN"),
+            "timestamp": time.time(),
+        })
+        return ret
 
     def execute_unblock(self, ip_address):
         """Removes a real or simulated firewall block rule."""
@@ -163,9 +184,16 @@ class FirewallResponseExecutor:
             except Exception as e:
                 logger.error(f"Failed to unblock {ip_address}: {e}")
 
-        return {
+        ret = {
             "status": "UNBLOCKED_SUCCESS",
             "ip_address": ip_address,
             "message": f"IP {ip_address} has been successfully unblocked.",
             "verification": self.verify_blocked(ip_address),
         }
+        self.action_history.append({
+            "action": "UNBLOCK",
+            "ip": ip_address,
+            "status": ret["status"],
+            "timestamp": time.time(),
+        })
+        return ret
