@@ -40,7 +40,13 @@ from modules.attack_journey_engine import AttackJourneyEngine
 from modules.explainable_graph_ai import ExplainableGraphAI
 from modules.mitre_attack_mapper import MITREAttackMapper
 from train_xgboost_ae import load_dataset
-from live_capture import start_capture, live_flows, capture_status
+from live_capture import (
+    start_capture,
+    live_flows,
+    capture_status,
+    get_live_flows_snapshot,
+    get_capture_status,
+)
 
 def debug_edge_decision(source_host, target_service,
                         xgb_prob, ae_score, fusion_score,
@@ -1316,13 +1322,8 @@ def is_live_capture_available() -> bool:
 
 
 def get_recent_live_flows(window_seconds: float = 10.0):
-    """Returns physical network flows captured within window_seconds."""
-    captured_flows = list(live_flows)
-    now_ts = time.time()
-    return [
-        f for f in captured_flows
-        if f.get("_capture_time") and (now_ts - f["_capture_time"]) <= window_seconds
-    ]
+    """Returns physical network flows captured within window_seconds in a thread-safe manner."""
+    return get_live_flows_snapshot(window_seconds=window_seconds)
 
 
 def check_active_live_traffic(window_seconds: float = 10.0):
