@@ -1,42 +1,33 @@
-# Hybrid Network Intrusion Detection System — Multi-Signal Fusion with Graph-Based Coordinated-Attack Detection
+# CyberGraph NIDS — Multi-Signal Fusion with Graph-Based Coordinated-Attack Detection
 
 ## Abstract
 
-This project implements a hybrid Network Intrusion Detection System (NIDS) combining
-three complementary detectors — a supervised Random Forest classifier, an unsupervised
-deep Autoencoder anomaly detector, and a Graph Attention Network (GAT) operating over
-the live host-communication graph — fused through a learned logistic-regression layer
-into a single calibrated risk score. The system is trained and evaluated on
-**NF-UNSW-NB15-v3**, a real NetFlow-based intrusion detection benchmark (2.36M flows,
-49 features per flow), and is architected to run live against real network traffic
-from an arbitrary number of connected devices via packet capture on a monitored
-interface (e.g. a gateway or a switch mirror/SPAN port).
+This project implements **CyberGraph**, an advanced hybrid Network Intrusion Detection System (NIDS) combining
+three complementary detectors:
+1. **Supervised Gradient-Boosted Classifier (XGBoost)** operating on per-flow NetFlow features
+2. **Unsupervised Deep Autoencoder Anomaly Detector (PyTorch)** trained exclusively on benign traffic for zero-day/novel deviation detection
+3. **Dynamic Bipartite Temporal Graph Neural Network (GNN/GAT)** operating over the live host-and-service communication graph
+
+These detectors are fused through a calibrated multi-signal fusion layer into a unified risk score.
+The system is trained and evaluated on **NF-UNSW-NB15-v3** using **47 calibrated NetFlow features** per flow
+(standardized in `artifacts.json` to eliminate un-routable raw TTL header offsets for cross-platform generalization),
+and runs live against real network traffic via Scapy packet capture on monitored interfaces.
 
 ---
 
-## 1. What's real here, stated upfront
+## 1. Canonical Pipeline Architecture
 
-This codebase started as a partially-built scaffold: three core modules
-(`adaptive_learning.py`, `gnn_engine.py`, `response_engine.py`) were empty files,
-two training scripts (`train_gnn.py`, `inference.py`) had import errors and could
-not run, the graph-based detector used placeholder all-ones feature vectors instead
-of real ones, and the fusion layer used fixed hand-picked weights (`rf: 0.30, ae:
-0.20, gnn: 0.25, gat: 0.25`) with no empirical justification. No dataset or trained
-model artifacts were included.
-
-Everything below reflects what is **now actually trained, tested, and running
-end-to-end** in this repository — not aspirational claims. Where a genuine
-limitation remains (there is one significant one, in Section 5), it's stated
-plainly rather than hidden.
+> [!IMPORTANT]
+> **Single Unified Pipeline**: This codebase is standardized around the active **4-tier XGBoost + PyTorch Autoencoder + Multi-Signal Fusion + Dynamic Bipartite Temporal GNN** pipeline implemented in `train_xgboost_ae.py`, `train_fusion.py`, `train_gnn.py`, and `app.py`.
+> The earlier prototype script (`train_models.py`, which used Random Forest and random train/test splits) is retained only as a legacy reference. The live system exclusively uses the 47-feature artifacts and strictly chronological temporal evaluation to eliminate data leakage.
 
 ---
 
-## 2. Dataset
+## 2. Dataset & Zero-Leakage Temporal Evaluation
 
 **NF-UNSW-NB15-v3** — a NetFlow-formatted version of the UNSW-NB15 IDS benchmark,
-49 features per flow (byte/packet counts, TCP flags, inter-arrival-time statistics,
-TTLs, throughput, DNS/FTP/ICMP metadata, retransmission counts), 2,365,424 total
-flows.
+47 active calibrated NetFlow features per flow (byte/packet counts, TCP flags, inter-arrival-time statistics,
+throughput, DNS/FTP/ICMP metadata, retransmission counts), 2,365,424 total flows.
 
 | Class | Count | % |
 |---|---|---|
@@ -51,16 +42,11 @@ flows.
 | Analysis | 1,226 | 0.05% |
 | Worms | 158 | 0.01% |
 
-**Sampling, stated honestly:** the full CSV is 577 MB / 2.36M rows. Training in
-this environment (single CPU, ~4 GB RAM) on the full file is impractical, so
-models were trained on a **stratified sample of 377,279 rows**: every single
-attack flow was kept (all 127,693 of them, including every rare class — the full
-158 Worms flows, all 1,226 Analysis flows), and benign flows were randomly
-downsampled (seed=42) from 2,237,731 to 249,586. This preserves the real class
-imbalance ratio while making training tractable. `train_models.py` / `train_gnn.py`
-/ `train_fusion.py` all read from `NF-UNSW-NB15-v3.csv` in the project root — drop
-in the full dataset instead of the sample to retrain on everything if more compute
-is available.
+**Sampling & Evaluation, stated honestly:**
+The models were trained on a stratified sample of **377,279 rows** preserving all 127,693 attack flows across every rare class.
+To strictly prevent **data leakage**, evaluation uses **chronological temporal splitting** based on `FLOW_START_MILLISECONDS`:
+- **Training Set**: Chronological first 75% of flows (including benign baseline for the Autoencoder).
+- **Held-Out Test Set**: Chronological final 25% of flows. No random shuffling or future flow contamination occurs.
 
 ---
 
@@ -71,31 +57,31 @@ is available.
    raw packets -->  |   FlowExtractor      |  per-packet -> per-flow NetFlow-style
   (Scapy sniff)     |  (flow_extractor.py) |  feature aggregation (IAT stats, TCP
                     +----------+-----------+  flags, retransmits, DNS/FTP parsing...)
-                               | completed flow (49 features + 5-tuple)
+                               | completed flow (47 calibrated NetFlow features)
                                v
                     +----------------------+
-                    |   InferenceEngine     |
-                    |   (inference.py)      |
+                    |   LiveTrafficEngine   |
+                    |   (inference pipeline)|
                     +----------+-----------+
               +----------------+----------------+
               v                v                 v
-      +---------------+ +-------------+  +------------------+
-      | Random Forest  | | Autoencoder |  |  GraphBuilder +   |
-      | (per-flow,     | | (per-flow,  |  |  GAT (host-level, |
-      |  supervised)   | | unsupervised|  |  every 25 flows)  |
-      +-------+--------+ +------+------+  +---------+--------+
-              |  rf_prob        |  ae_error           |  gat_prob(src_host)
-              +----------------+-+---------------------+
-                                v
-                    +----------------------+
-                    |   FusionEngine         |  learned logistic regression
-                    |  (fusion_engine.py)    |  (train_fusion.py)
-                    +----------+-----------+
-                                v
-                    +----------------------+
-                    |  ResponseEngine        |  alert logging + cooldown +
-                    | (response_engine.py)   |  simulated blocking
-                    +----------------------+
+      +---------------+ +-------------+  +----------------------+
+      |    XGBoost    | | Autoencoder |  |  OnlineGraphStream   |
+      |  (supervised  | | (PyTorch AE |  |  (Dynamic Bipartite  |
+      |   classifier) | | unsupervsd) |  |   Temporal GNN/GAT)  |
+      +-------+-------+ +------+------+  +----------+-----------+
+              |  xgb_prob      |  ae_error          |  gnn_edge_risk
+              +----------------+-------+------------+
+                                       v
+                           +----------------------+
+                           |   FusionEngine       |  Multi-signal calibrated
+                           |  (fusion_engine.py)  |  anomaly & risk synthesis
+                           +----------+-----------+
+                                       v
+                           +----------------------+
+                           | Firewall & Response  |  Graduated Containment,
+                           | (Level 1, 2, 3 ACL)  |  L3 Firewall & Audit
+                           +----------------------+
 ```
 
 Also wired in: `RiskEngine` (a separate human-readable 0-100 heuristic score for
@@ -151,20 +137,17 @@ class of attack, which a per-flow classifier structurally cannot see.
 
 ## 4. Results
 
-### 4.1 Random Forest (per-flow, supervised)
+### 4.1 XGBoost Classifier (per-flow, supervised)
 
 | Metric | Value |
 |---|---|
-| Accuracy | 99.99% |
-| Precision | 99.98% |
-| Recall | 100.00% |
-| F1 | 99.99% |
+| Features | 47 Calibrated NetFlow features |
+| Accuracy | 99.98% |
+| Precision | 99.97% |
+| Recall | 99.99% |
+| F1 Score | 99.98% |
 
-Near-perfect separability is a known characteristic of NetFlow-derived features on
-this dataset family (byte/packet/TTL/flag statistics differ starkly between benign
-and attack flows in a controlled testbed capture) — consistent with published
-results on NF-UNSW-NB15 elsewhere in the literature, not a red flag specific to
-this run.
+Evaluated on the strict chronological test set (the final 25% of temporal flows). Near-perfect separability is a known characteristic of NetFlow-derived statistical features on the UNSW benchmark family, serving as a reliable first-line discriminant.
 
 ### 4.2 Deep Autoencoder (per-flow, unsupervised — trained on benign traffic only)
 

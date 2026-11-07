@@ -163,8 +163,21 @@ def init_engines():
         mitre_mapper = MITREAttackMapper()
         xai_engine = ExplainableGraphAI()
 
-        df_full = load_dataset()
-        df_stream_pool = df_full.iloc[int(len(df_full) * 0.75):].reset_index(drop=True)
+        bari_baseline_path = os.path.join(MODELS_DIR, "bari_baseline.json")
+        if os.path.exists(bari_baseline_path):
+            bari_engine.load_baseline(bari_baseline_path)
+        else:
+            try:
+                df_full = load_dataset()
+                df_benign = df_full[df_full["label_enc"] == 0][["IPV4_SRC_ADDR", "L4_DST_PORT", "PROTOCOL"]]
+                bari_engine.learn_normal_baseline(df_benign)
+                bari_engine.save_baseline(bari_baseline_path)
+            except Exception as e:
+                logger.warning(f"Could not initialize BARI baseline from dataset: {e}")
+
+        if df_stream_pool is None:
+            df_full = load_dataset()
+            df_stream_pool = df_full.iloc[int(len(df_full) * 0.75):].reset_index(drop=True)
 
         if os.path.exists(GNN_MODEL_PATH) and os.path.exists(SCALERS_PATH):
             scalers = joblib.load(SCALERS_PATH)
@@ -173,10 +186,6 @@ def init_engines():
             )
             gnn_model.load_state_dict(torch.load(GNN_MODEL_PATH, weights_only=True))
             gnn_stream = OnlineGraphStream(gnn_model, scalers)
-
-            # Learn BARI benign baseline from training data
-            df_benign = df_full[df_full["label_enc"] == 0][["IPV4_SRC_ADDR", "L4_DST_PORT", "PROTOCOL"]]
-            bari_engine.learn_normal_baseline(df_benign)
 
         try:
             start_capture(iface=None)
@@ -2312,6 +2321,18 @@ def sync_network_state(force_scan: bool = False, profile_override: Optional[dict
         )
 
 
+def get_stream_pool():
+    global df_stream_pool
+    if df_stream_pool is None:
+        try:
+            df_full = load_dataset()
+            df_stream_pool = df_full.iloc[int(len(df_full) * 0.75):].reset_index(drop=True)
+        except Exception as e:
+            logger.warning(f"Could not load offline stream pool: {e}")
+            df_stream_pool = pd.DataFrame()
+    return df_stream_pool
+
+
 def _run_pipeline_cycle(batch_override=None):
     """Executes a single processing cycle for the server-authoritative pipeline."""
     global stream_cursor, shared_state, _last_pipeline_state, _last_explain_state, _recent_event_history
@@ -2334,26 +2355,31 @@ def _run_pipeline_cycle(batch_override=None):
         buf_count = len(batch_override)
         batch_records = list(batch_override)
     elif mode == "offline":
+        pool = get_stream_pool()
         data_source = "OFFLINE DATASET STREAM (NF-UNSW-NB15)"
         buf_count = 0
-        if stream_cursor + batch_sz >= len(df_stream_pool):
-            stream_cursor = 0
-        batch_df = df_stream_pool.iloc[stream_cursor : stream_cursor + batch_sz]
-        stream_cursor += batch_sz
-        batch_records = batch_df.to_dict(orient="records")
+        if len(pool) > 0:
+            if stream_cursor + batch_sz >= len(pool):
+                stream_cursor = 0
+            batch_df = pool.iloc[stream_cursor : stream_cursor + batch_sz]
+            stream_cursor += batch_sz
+            batch_records = batch_df.to_dict(orient="records")
+        else:
+            batch_records = []
 
     elif mode == "attack":
+        pool = get_stream_pool()
         if capture_available:
             data_source = "LIVE WI-FI PACKETS + REPLAY ATTACK SCENARIO"
             buf_count = len(recent_live)
-            attack_sub = df_stream_pool[df_stream_pool["label_enc"] == 1]
-            batch_df = attack_sub.sample(n=min(batch_sz, len(attack_sub)))
+            attack_sub = pool[pool["label_enc"] == 1] if len(pool) > 0 and "label_enc" in pool.columns else pool
+            batch_df = attack_sub.sample(n=min(batch_sz, len(attack_sub))) if len(attack_sub) > 0 else attack_sub
             batch_records = recent_live[-5:] + batch_df.to_dict(orient="records")[:max(1, batch_sz - len(recent_live[-5:]))]
         else:
             data_source = "REPLAY ATTACK SCENARIO (STATIC DATASET STREAM - WI-FI DISCONNECTED)"
             buf_count = 0
-            attack_sub = df_stream_pool[df_stream_pool["label_enc"] == 1]
-            batch_df = attack_sub.sample(n=min(batch_sz, len(attack_sub)))
+            attack_sub = pool[pool["label_enc"] == 1] if len(pool) > 0 and "label_enc" in pool.columns else pool
+            batch_df = attack_sub.sample(n=min(batch_sz, len(attack_sub))) if len(attack_sub) > 0 else attack_sub
             batch_records = batch_df.to_dict(orient="records")
 
         now_ms = time.time() * 1000.0
@@ -2368,13 +2394,17 @@ def _run_pipeline_cycle(batch_override=None):
             # maintain LIVE mode with an empty batch (do NOT fall back to offline dataset).
             batch_records = recent_live[-batch_sz:] if has_recent_live else []
         else:
+            pool = get_stream_pool()
             data_source = "OFFLINE DATASET STREAM (NF-UNSW-NB15 - WI-FI DISCONNECTED)"
             buf_count = 0
-            if stream_cursor + batch_sz >= len(df_stream_pool):
-                stream_cursor = 0
-            batch_df = df_stream_pool.iloc[stream_cursor : stream_cursor + batch_sz]
-            stream_cursor += batch_sz
-            batch_records = batch_df.to_dict(orient="records")
+            if len(pool) > 0:
+                if stream_cursor + batch_sz >= len(pool):
+                    stream_cursor = 0
+                batch_df = pool.iloc[stream_cursor : stream_cursor + batch_sz]
+                stream_cursor += batch_sz
+                batch_records = batch_df.to_dict(orient="records")
+            else:
+                batch_records = []
 
     evals = []
     host_risk_map = {}

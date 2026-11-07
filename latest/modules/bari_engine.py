@@ -25,6 +25,8 @@ Components & Route Memory Architecture:
 
 import time
 import math
+import os
+import json
 from collections import defaultdict, deque
 
 # Default fallback sensitivities for common service ports (used before baseline learning or fallback)
@@ -125,6 +127,39 @@ class BARIEngine:
 
         self._learned_sensitivity = learned_sens
         self._baseline_learned = True
+
+    def load_baseline(self, filepath: str) -> bool:
+        """Loads precomputed benign route memory and sensitivities from JSON in milliseconds."""
+        if not os.path.exists(filepath):
+            return False
+        try:
+            with open(filepath, "r") as f:
+                data = json.load(f)
+            self._benign_service_counts = defaultdict(int, data.get("counts", {}))
+            self._benign_transition_counts = defaultdict(lambda: defaultdict(int))
+            for k, v in data.get("transitions", {}).items():
+                self._benign_transition_counts[k] = defaultdict(int, v)
+            self._benign_total_flows = data.get("total", 1)
+            self._learned_sensitivity = data.get("learned_sensitivity", {})
+            self._baseline_learned = True
+            return True
+        except Exception:
+            return False
+
+    def save_baseline(self, filepath: str) -> bool:
+        """Exports learned benign route memory to JSON."""
+        try:
+            data = {
+                "counts": dict(self._benign_service_counts),
+                "transitions": {k: dict(v) for k, v in self._benign_transition_counts.items()},
+                "total": self._benign_total_flows,
+                "learned_sensitivity": self._learned_sensitivity,
+            }
+            with open(filepath, "w") as f:
+                json.dump(data, f, indent=2)
+            return True
+        except Exception:
+            return False
 
     def get_service_sensitivity(self, dst_port: int, protocol: int = 6) -> float:
         """Data-driven service sensitivity score in [0.05, 1.00]."""
