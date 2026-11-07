@@ -2388,16 +2388,14 @@ def _run_pipeline_cycle(batch_override=None):
             r["timestamp"] = now_ms
 
     else:  # mode == "normal"
-        if capture_available:
+        if capture_available and has_recent_live:
             data_source = "LIVE WI-FI PACKETS (PHYSICAL CAPTURE ACTIVE)"
             buf_count = len(recent_live)
-            # Process recent live flows if present. If physical traffic is temporarily idle,
-            # maintain LIVE mode with an empty batch (do NOT fall back to offline dataset).
-            batch_records = recent_live[-batch_sz:] if has_recent_live else []
+            batch_records = recent_live[-batch_sz:]
         else:
             pool = get_stream_pool()
-            data_source = "OFFLINE DATASET STREAM (NF-UNSW-NB15 - WI-FI DISCONNECTED)"
-            buf_count = 0
+            data_source = "OFFLINE DATASET STREAM (NF-UNSW-NB15)"
+            buf_count = len(recent_live)
             if len(pool) > 0:
                 if stream_cursor + batch_sz >= len(pool):
                     stream_cursor = 0
@@ -2426,6 +2424,19 @@ def _run_pipeline_cycle(batch_override=None):
         try:
             t_gnn_start = time.perf_counter()
             flow_rec = traffic_engine.process_flow_record(rec)
+
+            # Local broadcast/multicast discovery protection
+            flow_dst_ip = str(flow_rec.get("dst_ip", ""))
+            is_lan_discovery = (
+                flow_dst_ip == "255.255.255.255"
+                or flow_dst_ip.endswith(".255")
+                or flow_dst_ip.startswith("224.0.0.")
+                or flow_dst_ip.startswith("239.255.")
+            )
+            if is_lan_discovery:
+                # Local network broadcast/multicast (e.g. SSDP, NetBIOS, printer discovery) is normal background noise
+                flow_rec["xgb_prob"] = min(float(flow_rec.get("xgb_prob", 0.0)), 0.05)
+                flow_rec["fusion_score"] = min(float(flow_rec.get("fusion_score", 0.0)), 0.05)
 
             base_fusion = float(flow_rec["fusion_score"])
             gnn_edge_risk = 0.0

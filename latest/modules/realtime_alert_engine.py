@@ -225,10 +225,18 @@ class RealtimeAlertEngine:
         ),
         "attack_journey": journey_payload,
     }
-        fw_res = self.fw_executor.execute_block(
-    src_ip,
-    port=dst_port,
-)
+        if src_ip in ("127.0.0.1", "::1", "localhost"):
+            fw_res = {
+                "status": "PROTECTED_HOST",
+                "execution_mode": "PROTECTED_SERVER",
+                "ip_address": src_ip,
+                "message": f"IP {src_ip} is protected (monitoring server/loopback); block suppressed.",
+            }
+        else:
+            fw_res = self.fw_executor.execute_block(
+                src_ip,
+                port=dst_port,
+            )
 
         attack_paths = []
 
