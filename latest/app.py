@@ -136,6 +136,7 @@ xai_engine = None
 _last_pipeline_state = {}
 _last_explain_state = {}
 _recent_event_history = []
+_active_threat_cards = {}  # key -> {"eval": dict, "expires_at": float, "created_at": float}
 
 # ---------------------------------------------------------------------------
 # ---------------------------------------------------------------------------
@@ -2277,6 +2278,7 @@ def _run_pipeline_cycle(batch_override=None):
     host_risk_map = {}
     host_nodes_dict = {}
     service_nodes_dict = {}
+    raw_edge_list = []
     edge_risk_list = []
     risk_scores = []
     l1_count = 0
@@ -2554,12 +2556,15 @@ def _run_pipeline_cycle(batch_override=None):
         else:
             edge_source_label = f"EXT:{clean_src}"
 
-        edge_risk_list.append({
+        raw_edge_list.append({
             "source_label": edge_source_label,
             "target_label": clean_dst,
             "risk": combined_risk,
             "level": edge_level,
             "color": edge_color,
+            "src_ip": clean_src,
+            "dst_port": flow_rec.get("dst_port"),
+            "protocol": flow_rec.get("protocol"),
         })
 
         evals.append(eval_res)
@@ -2571,6 +2576,32 @@ def _run_pipeline_cycle(batch_override=None):
             "gnn_risk": combined_risk,
             "final_tier": display_tier,
         }
+
+    # Aggregate repeated connections from the same system to the same service (e.g. port 5000),
+    # preserving source, destination, protocol, and service differences while grouping duplicates.
+    aggregated_edges = {}
+    for edge in raw_edge_list:
+        pair_key = (edge["source_label"], edge["target_label"])
+        if pair_key not in aggregated_edges:
+            aggregated_edges[pair_key] = {
+                "source_label": edge["source_label"],
+                "target_label": edge["target_label"],
+                "risk": edge["risk"],
+                "level": edge["level"],
+                "color": edge["color"],
+                "count": 1,
+                "dst_port": edge.get("dst_port"),
+                "protocol": edge.get("protocol"),
+            }
+        else:
+            entry = aggregated_edges[pair_key]
+            entry["count"] += 1
+            if edge["risk"] > entry["risk"]:
+                entry["risk"] = edge["risk"]
+                entry["level"] = edge["level"]
+                entry["color"] = edge["color"]
+
+    edge_risk_list = list(aggregated_edges.values())
 
     # Diagnostic logging before graph rendering
     srv_ip_log = get_server_local_ip()
@@ -2726,11 +2757,44 @@ def _run_pipeline_cycle(batch_override=None):
         shared_state["server_status"]["traffic_recent"] = has_recent_live
         shared_state["server_status"]["processing_thread_alive"] = True
 
-        # Merge new deduplicated events at head of evals list (max 30)
-        if deduped_evals:
-            shared_state["evals"] = deduped_evals[:30]
-        else:
-            shared_state["evals"] = []
+        # Retain threat cards for specified durations without resetting unrelated cards:
+        # Level 1: 15 seconds (10-20s window)
+        # Level 2: 45 seconds
+        # Level 3: 75 seconds (60-90s window)
+        now_ts = time.time()
+        for ev in deduped_evals:
+            lvl = ev.get("level", "")
+            if "Level 3" in lvl or ev.get("risk_category") == "CRITICAL_ATTACK_THREAT":
+                card_duration = 75.0
+            elif "Level 2" in lvl or ev.get("risk_category") == "EARLY_WARNING_THREAT":
+                card_duration = 45.0
+            else:
+                card_duration = 15.0
+
+            card_key = (ev.get("source_host"), ev.get("target_service"), lvl)
+            if card_key in _active_threat_cards:
+                existing = _active_threat_cards[card_key]
+                existing["eval"] = ev
+                existing["expires_at"] = max(existing["expires_at"], now_ts + card_duration)
+            else:
+                _active_threat_cards[card_key] = {
+                    "eval": ev,
+                    "expires_at": now_ts + card_duration,
+                    "created_at": now_ts,
+                }
+
+        # Evict expired threat cards
+        expired_keys = [k for k, v in _active_threat_cards.items() if now_ts >= v["expires_at"]]
+        for k in expired_keys:
+            del _active_threat_cards[k]
+
+        def _card_sort_key(item):
+            lvl_str = item["eval"].get("level", "")
+            sev = 3 if "Level 3" in lvl_str else (2 if "Level 2" in lvl_str else 1)
+            return (sev, item["created_at"])
+
+        sorted_cards = sorted(_active_threat_cards.values(), key=_card_sort_key, reverse=True)
+        shared_state["evals"] = [c["eval"] for c in sorted_cards[:30]]
 
         shared_state["state_version"] += 1
         curr_ver = shared_state["state_version"]
