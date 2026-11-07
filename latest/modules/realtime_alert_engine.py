@@ -28,11 +28,11 @@ logger = logging.getLogger(__name__)
 class RealtimeAlertEngine:
     """Tiered real-time security response and alerting engine."""
 
-    def __init__(self, enable_real_blocking=False, bari_engine=None):
+    def __init__(self, enable_real_blocking=False, bari_engine=None, fw_executor=None):
         self.enable_real_blocking = enable_real_blocking
         self.predictor = AttackPathPredictor(risk_threshold=0.50)
         self.xai = ExplainableGraphAI()
-        self.fw_executor = FirewallResponseExecutor(
+        self.fw_executor = fw_executor or FirewallResponseExecutor(
             enable_real_blocking=enable_real_blocking
         )
         self.journey_engine = AttackJourneyEngine()
@@ -272,6 +272,7 @@ class RealtimeAlertEngine:
                     fw_res.get("message", ""),
                 ),
                 "real_blocking_enabled": self.enable_real_blocking,
+                "verification": fw_res.get("verification") or self.fw_executor.verify_blocked(src_ip),
             },
             "summary": (
                 f"CRITICAL ATTACK: [{host_id} -> {service_id}] "

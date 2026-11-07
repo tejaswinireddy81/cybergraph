@@ -24,6 +24,7 @@ from config.risk_thresholds import (
     AE_SCORE_HIGH,
 )
 import socket
+import ipaddress
 import torch
 import joblib
 
@@ -153,8 +154,8 @@ def init_engines():
 
     if traffic_engine is None:
         traffic_engine = LiveTrafficEngine()
-        alert_engine = RealtimeAlertEngine(enable_real_blocking=False)
         fw_executor = FirewallResponseExecutor(enable_real_blocking=False)
+        alert_engine = RealtimeAlertEngine(enable_real_blocking=False, fw_executor=fw_executor)
         correlation_engine = CorrelationEngine()
         bari_engine = BARIEngine()
         attack_journey_engine = AttackJourneyEngine()
@@ -3004,23 +3005,95 @@ def export_report():
     return Response(report_html, mimetype="text/html")
 
 
-@app.route("/api/execute_real_block")
+@app.route("/api/execute_real_block", methods=["GET", "POST"])
 def execute_real_block():
     init_engines()
-    target_ip = request.args.get("ip", "")
+    if not is_admin_request():
+        logger.warning(f"[SECURITY 403] Unauthorized execute_real_block attempt from client IP: {request.remote_addr}")
+        return jsonify({
+            "status": "ERROR",
+            "message": "Forbidden: Administrative access required"
+        }), 403
+
+    target_ip = request.args.get("ip") or request.args.get("target_ip")
+    if not target_ip and request.is_json:
+        data = request.get_json(silent=True) or {}
+        target_ip = data.get("ip") or data.get("target_ip")
+
     if not target_ip:
         return jsonify({"status": "ERROR", "message": "Missing IP parameter."}), 400
 
-    clean_ip = target_ip.replace("HOST:", "").replace("SERVICE:", "")
-    if clean_ip.count(".") == 1 and clean_ip.endswith(".0"):
-        clean_ip = clean_ip[:-2]
+    clean_ip = str(target_ip).replace("HOST:", "").replace("SERVICE:", "").replace("EXTERNAL:", "").replace("GATEWAY:", "").strip()
+    if "/" in clean_ip:
+        clean_ip = clean_ip.split("/")[0]
+    if ":" in clean_ip and clean_ip.count(":") == 1:
+        clean_ip = clean_ip.split(":")[0]
+
+    try:
+        ipaddress.ip_address(clean_ip)
+    except ValueError:
+        return jsonify({"status": "ERROR", "message": f"Invalid IP address: '{target_ip}'"}), 400
 
     res = fw_executor.execute_block(clean_ip, force_real=True)
-    if res["status"] in ["REAL_FIREWALL_RULE_APPLIED", "REAL_FIREWALL_RULE_ELEVATED"]:
+    if res.get("status") in ["REAL_FIREWALL_RULE_APPLIED", "REAL_FIREWALL_RULE_ELEVATED"] or res.get("execution_mode") in ["REAL_OS_FIREWALL", "REAL_OS_FIREWALL_ELEVATED"]:
         with state_lock:
             shared_state["stats"]["real_os_rules_applied"] += 1
 
     return jsonify(res)
+
+
+@app.route("/api/unblock_ip", methods=["GET", "POST"])
+def api_unblock_ip():
+    init_engines()
+    if not is_admin_request():
+        logger.warning(f"[SECURITY 403] Unauthorized unblock_ip attempt from client IP: {request.remote_addr}")
+        return jsonify({
+            "status": "ERROR",
+            "message": "Forbidden: Administrative access required"
+        }), 403
+
+    target_ip = request.args.get("ip") or request.args.get("target_ip")
+    if not target_ip and request.is_json:
+        data = request.get_json(silent=True) or {}
+        target_ip = data.get("ip") or data.get("target_ip")
+
+    if not target_ip:
+        return jsonify({"status": "ERROR", "message": "Missing IP parameter."}), 400
+
+    clean_ip = str(target_ip).replace("HOST:", "").replace("SERVICE:", "").replace("EXTERNAL:", "").replace("GATEWAY:", "").strip()
+    if "/" in clean_ip:
+        clean_ip = clean_ip.split("/")[0]
+    if ":" in clean_ip and clean_ip.count(":") == 1:
+        clean_ip = clean_ip.split(":")[0]
+
+    try:
+        ipaddress.ip_address(clean_ip)
+    except ValueError:
+        return jsonify({"status": "ERROR", "message": f"Invalid IP address: '{target_ip}'"}), 400
+
+    res = fw_executor.execute_unblock(clean_ip)
+    return jsonify(res)
+
+
+@app.route("/api/verify_blocked", methods=["GET"])
+def api_verify_blocked():
+    init_engines()
+    target_ip = request.args.get("ip") or request.args.get("target_ip")
+    if not target_ip:
+        return jsonify({"status": "ERROR", "message": "Missing IP parameter."}), 400
+
+    clean_ip = str(target_ip).replace("HOST:", "").replace("SERVICE:", "").replace("EXTERNAL:", "").replace("GATEWAY:", "").strip()
+    if "/" in clean_ip:
+        clean_ip = clean_ip.split("/")[0]
+    if ":" in clean_ip and clean_ip.count(":") == 1:
+        clean_ip = clean_ip.split(":")[0]
+
+    try:
+        ipaddress.ip_address(clean_ip)
+    except ValueError:
+        return jsonify({"status": "ERROR", "message": f"Invalid IP address: '{target_ip}'"}), 400
+
+    return jsonify(fw_executor.verify_blocked(clean_ip))
 
 
 @app.before_request
@@ -3035,8 +3108,11 @@ def handle_device_access_request():
         g.new_device_token = None
 
     client_ip = request.remote_addr or "127.0.0.1"
-    if request.headers.get("X-Forwarded-For"):
-        client_ip = request.headers.get("X-Forwarded-For").split(",")[0].strip()
+    # Never trust X-Forwarded-For from external clients to prevent spoofing
+    if request.headers.get("X-Forwarded-For") and client_ip in ("127.0.0.1", "::1", "localhost"):
+        fwd = request.headers.get("X-Forwarded-For").split(",")[0].strip()
+        if fwd:
+            client_ip = fwd
 
     g.client_device_token = token
     g.client_ip = client_ip
@@ -3061,8 +3137,6 @@ def is_admin_request() -> bool:
     """Determine if current HTTP request originates from the authoritative CyberGraph Server/Admin."""
     srv_ip = get_server_local_ip()
     client_ip = request.remote_addr or "127.0.0.1"
-    if request.headers.get("X-Forwarded-For"):
-        client_ip = request.headers.get("X-Forwarded-For").split(",")[0].strip()
 
     # 1. Local loopback on the server host
     if client_ip in ("127.0.0.1", "::1", "localhost", "0.0.0.0"):

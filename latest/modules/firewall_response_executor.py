@@ -153,12 +153,13 @@ class FirewallResponseExecutor:
         preview = self.generate_rule_preview(ip_address)
 
         if ip_address in self.simulated_acl_blocked_ips:
-            self.simulated_acl_blocked_ips.remove(ip_address)
+            self.simulated_acl_blocked_ips.discard(ip_address)
 
-        if ip_address in self.active_os_firewall_rules:
-            unblock_cmd = self.active_os_firewall_rules.pop(ip_address)
+        unblock_cmd = self.active_os_firewall_rules.pop(ip_address, None)
+        if unblock_cmd or self.enable_real_blocking:
+            cmd = unblock_cmd or preview["unblock_command_preview"]
             try:
-                subprocess.run(unblock_cmd, shell=True, capture_output=True, text=True, timeout=5)
+                subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=5)
             except Exception as e:
                 logger.error(f"Failed to unblock {ip_address}: {e}")
 
