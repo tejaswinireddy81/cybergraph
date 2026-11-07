@@ -66,14 +66,20 @@ def test_html_and_client_contain_xss_protection_helpers():
 
 def test_api_error_handling_malformed_inputs():
     """Requirement: All API endpoints handle missing or malformed inputs with 400 Bad Request, never 500."""
+    from app import get_admin_token
+    token = get_admin_token()
     client = app.test_client()
 
-    # Missing params
-    res1 = client.get("/api/execute_real_block", environ_base={"REMOTE_ADDR": "127.0.0.1"})
+    # GET to state-changing routes returns 405 Method Not Allowed
+    assert client.get("/api/execute_real_block").status_code == 405
+    assert client.get("/api/unblock_ip").status_code == 405
+
+    # Missing params on POST with Admin Token
+    res1 = client.post("/api/execute_real_block", json={}, headers={"X-Admin-Token": token}, environ_base={"REMOTE_ADDR": "127.0.0.1"})
     assert res1.status_code == 400
     assert "Missing IP" in res1.get_json()["message"]
 
-    res2 = client.get("/api/unblock_ip", environ_base={"REMOTE_ADDR": "127.0.0.1"})
+    res2 = client.post("/api/unblock_ip", json={}, headers={"X-Admin-Token": token}, environ_base={"REMOTE_ADDR": "127.0.0.1"})
     assert res2.status_code == 400
     assert "Missing IP" in res2.get_json()["message"]
 
@@ -81,20 +87,20 @@ def test_api_error_handling_malformed_inputs():
     assert res3.status_code == 400
     assert "Missing IP" in res3.get_json()["message"]
 
-    # Invalid IPs
-    res4 = client.get("/api/execute_real_block?ip=not_an_ip", environ_base={"REMOTE_ADDR": "127.0.0.1"})
+    # Invalid IPs on POST with Admin Token
+    res4 = client.post("/api/execute_real_block", json={"ip": "not_an_ip"}, headers={"X-Admin-Token": token}, environ_base={"REMOTE_ADDR": "127.0.0.1"})
     assert res4.status_code == 400
     assert "Invalid IP" in res4.get_json()["message"]
 
-    res5 = client.get("/api/unblock_ip?ip=999.999.999.999", environ_base={"REMOTE_ADDR": "127.0.0.1"})
+    res5 = client.post("/api/unblock_ip", json={"ip": "999.999.999.999"}, headers={"X-Admin-Token": token}, environ_base={"REMOTE_ADDR": "127.0.0.1"})
     assert res5.status_code == 400
     assert "Invalid IP" in res5.get_json()["message"]
 
     # Missing parameters for device actions
-    res6 = client.post("/api/approve_device", json={}, environ_base={"REMOTE_ADDR": "127.0.0.1"})
+    res6 = client.post("/api/approve_device", json={}, headers={"X-Admin-Token": token}, environ_base={"REMOTE_ADDR": "127.0.0.1"})
     assert res6.status_code == 400
 
-    res7 = client.post("/api/revoke_device", json={}, environ_base={"REMOTE_ADDR": "127.0.0.1"})
+    res7 = client.post("/api/revoke_device", json={}, headers={"X-Admin-Token": token}, environ_base={"REMOTE_ADDR": "127.0.0.1"})
     assert res7.status_code == 400
 
 

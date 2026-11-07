@@ -17,6 +17,7 @@ from app import (
     fw_executor,
     traffic_engine,
     is_admin_request,
+    get_admin_token,
     set_network_profile_override,
     _authorized_monitored_devices,
     state_lock,
@@ -47,12 +48,16 @@ def test_no_duplicate_live_traffic_engine_in_live_capture():
 
 
 def test_admin_authorization_prevents_unauthorized_execute_real_block():
-    """Requirement: Remote client receives 403 when calling execute_real_block."""
+    """Requirement: Remote client receives 403 when calling execute_real_block without admin token, and GET is blocked (405)."""
     client = app.test_client()
     remote_ip = "10.160.36.186"
 
-    # Attempt without admin from remote IP
-    res = client.get("/api/execute_real_block?ip=10.0.0.99", environ_base={"REMOTE_ADDR": remote_ip})
+    # GET is rejected to prevent CSRF via <img src> or <a> tag
+    res_get = client.get("/api/execute_real_block?ip=10.0.0.99", environ_base={"REMOTE_ADDR": remote_ip})
+    assert res_get.status_code == 405
+
+    # POST without admin token receives 403 Forbidden
+    res = client.post("/api/execute_real_block", json={"ip": "10.0.0.99"}, environ_base={"REMOTE_ADDR": remote_ip})
     assert res.status_code == 403
     data = res.get_json()
     assert data["status"] == "ERROR"
@@ -60,12 +65,16 @@ def test_admin_authorization_prevents_unauthorized_execute_real_block():
 
 
 def test_admin_authorization_prevents_unauthorized_unblock():
-    """Requirement: Remote client receives 403 when calling unblock_ip."""
+    """Requirement: Remote client receives 403 when calling unblock_ip without admin token, and GET is blocked (405)."""
     client = app.test_client()
     remote_ip = "10.160.36.186"
 
-    # Attempt without admin from remote IP
-    res = client.get("/api/unblock_ip?ip=10.0.0.99", environ_base={"REMOTE_ADDR": remote_ip})
+    # GET is rejected to prevent CSRF
+    res_get = client.get("/api/unblock_ip?ip=10.0.0.99", environ_base={"REMOTE_ADDR": remote_ip})
+    assert res_get.status_code == 405
+
+    # POST without admin token receives 403 Forbidden
+    res = client.post("/api/unblock_ip", json={"ip": "10.0.0.99"}, environ_base={"REMOTE_ADDR": remote_ip})
     assert res.status_code == 403
     data = res.get_json()
     assert data["status"] == "ERROR"
@@ -77,16 +86,18 @@ def test_anti_spoofing_arbitrary_x_forwarded_for_rejected():
     client = app.test_client()
     remote_ip = "10.160.36.186"
 
-    # Spoof attempt: remote client claims loopback in X-Forwarded-For
-    res = client.get(
-        "/api/execute_real_block?ip=10.0.0.99",
+    # Spoof attempt: remote client claims loopback in X-Forwarded-For on POST
+    res = client.post(
+        "/api/execute_real_block",
+        json={"ip": "10.0.0.99"},
         headers={"X-Forwarded-For": "127.0.0.1"},
         environ_base={"REMOTE_ADDR": remote_ip},
     )
     assert res.status_code == 403
 
-    res_unblock = client.get(
-        "/api/unblock_ip?ip=10.0.0.99",
+    res_unblock = client.post(
+        "/api/unblock_ip",
+        json={"ip": "10.0.0.99"},
         headers={"X-Forwarded-For": "127.0.0.1"},
         environ_base={"REMOTE_ADDR": remote_ip},
     )
@@ -94,17 +105,20 @@ def test_anti_spoofing_arbitrary_x_forwarded_for_rejected():
 
 
 def test_admin_execute_block_and_verify_simulation_mode():
-    """Requirement: Admin can block IP in simulation mode and verify status."""
+    """Requirement: Admin can block IP in simulation mode and verify status with valid Admin Token."""
     client = app.test_client()
     target_ip = "192.168.1.188"
+    token = get_admin_token()
 
     # Ensure unblocked first
     from app import fw_executor
     fw_executor.execute_unblock(target_ip)
 
-    # Admin executes block
-    res = client.get(
-        f"/api/execute_real_block?ip={target_ip}",
+    # Admin executes block via POST with X-Admin-Token
+    res = client.post(
+        "/api/execute_real_block",
+        json={"ip": target_ip},
+        headers={"X-Admin-Token": token},
         environ_base={"REMOTE_ADDR": "127.0.0.1"},
     )
     assert res.status_code == 200
@@ -122,18 +136,21 @@ def test_admin_execute_block_and_verify_simulation_mode():
 
 
 def test_admin_unblock_ip_endpoint_restores_allowed_status():
-    """Requirement: /api/unblock_ip unblocks previously blocked IP."""
+    """Requirement: /api/unblock_ip unblocks previously blocked IP via POST with Admin Token."""
     client = app.test_client()
     target_ip = "192.168.1.189"
+    token = get_admin_token()
 
     # Block IP first
     from app import fw_executor
     fw_executor.execute_block(target_ip)
     assert fw_executor.verify_blocked(target_ip)["is_blocked"] is True
 
-    # Call /api/unblock_ip as Admin
-    res = client.get(
-        f"/api/unblock_ip?ip={target_ip}",
+    # Call /api/unblock_ip as Admin via POST
+    res = client.post(
+        "/api/unblock_ip",
+        json={"ip": target_ip},
+        headers={"X-Admin-Token": token},
         environ_base={"REMOTE_ADDR": "127.0.0.1"},
     )
     assert res.status_code == 200
@@ -149,12 +166,51 @@ def test_admin_unblock_ip_endpoint_restores_allowed_status():
 def test_invalid_ip_handling():
     """Requirement: Malformed IP addresses return 400 Bad Request."""
     client = app.test_client()
+    token = get_admin_token()
 
-    res_block = client.get("/api/execute_real_block?ip=not-an-ip", environ_base={"REMOTE_ADDR": "127.0.0.1"})
+    res_block = client.post(
+        "/api/execute_real_block",
+        json={"ip": "not-an-ip"},
+        headers={"X-Admin-Token": token},
+        environ_base={"REMOTE_ADDR": "127.0.0.1"},
+    )
     assert res_block.status_code == 400
     assert "Invalid IP" in res_block.get_json()["message"]
 
-    res_unblock = client.get("/api/unblock_ip?ip=invalid_addr", environ_base={"REMOTE_ADDR": "127.0.0.1"})
+    res_unblock = client.post(
+        "/api/unblock_ip",
+        json={"ip": "invalid_addr"},
+        headers={"X-Admin-Token": token},
+        environ_base={"REMOTE_ADDR": "127.0.0.1"},
+    )
     assert res_unblock.status_code == 400
     assert "Invalid IP" in res_unblock.get_json()["message"]
+
+
+def test_protected_whitelist_and_ipv6_handling():
+    """Requirement: Gateway and Server IPs cannot be blocked; IPv6 parsed accurately."""
+    client = app.test_client()
+    token = get_admin_token()
+
+    # Attempt to block Gateway IP (10.160.36.14)
+    res_gw = client.post(
+        "/api/execute_real_block",
+        json={"ip": "10.160.36.14"},
+        headers={"X-Admin-Token": token},
+        environ_base={"REMOTE_ADDR": "127.0.0.1"},
+    )
+    assert res_gw.status_code == 200
+    data_gw = res_gw.get_json()
+    assert data_gw["status"] == "ERROR"
+    assert data_gw["execution_mode"] == "PROTECTED_WHITELIST"
+
+    # Test IPv6 address support
+    res_ipv6 = client.post(
+        "/api/execute_real_block",
+        json={"ip": "2001:db8::cafe"},
+        headers={"X-Admin-Token": token},
+        environ_base={"REMOTE_ADDR": "127.0.0.1"},
+    )
+    assert res_ipv6.status_code == 200
+    assert res_ipv6.get_json()["verification"]["is_blocked"] is True
 

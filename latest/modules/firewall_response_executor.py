@@ -35,6 +35,25 @@ class FirewallResponseExecutor:
         self.simulated_acl_blocked_ips = set()
         self.active_os_firewall_rules = {}
         self.action_history = []
+        self.protected_ips = {"127.0.0.1", "::1", "localhost", "0.0.0.0"}
+
+    def add_protected_ip(self, ip_str):
+        """Register a critical IP (e.g. Gateway, DNS, Server IP) that must never be blocked."""
+        if ip_str and self.validate_ip(ip_str):
+            self.protected_ips.add(ip_str.strip())
+
+    def is_protected(self, ip_str):
+        """Check if an IP address belongs to the protected system/gateway/DNS whitelist."""
+        clean = ip_str.strip() if ip_str else ""
+        if clean in self.protected_ips:
+            return True
+        try:
+            ip_obj = ipaddress.ip_address(clean)
+            if ip_obj.is_loopback or ip_obj.is_multicast or ip_obj.is_reserved or ip_obj.is_link_local:
+                return True
+        except ValueError:
+            pass
+        return False
 
     def validate_ip(self, ip_address):
         """Validates that ip_address is a syntactically valid IPv4 or IPv6 address string."""
@@ -117,6 +136,14 @@ class FirewallResponseExecutor:
             }
 
         clean_ip = ip_address.strip()
+        if self.is_protected(clean_ip):
+            return {
+                "status": "ERROR",
+                "execution_mode": "PROTECTED_WHITELIST",
+                "ip_address": clean_ip,
+                "message": f"Rejected block action: '{clean_ip}' is a protected system/gateway/DNS address.",
+            }
+
         preview = self.generate_rule_preview(clean_ip, port)
         should_execute_real = force_real or self.enable_real_blocking
 

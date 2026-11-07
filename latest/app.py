@@ -78,6 +78,66 @@ MODELS_DIR = os.path.join(HERE, "models")
 GNN_MODEL_PATH = os.path.join(MODELS_DIR, "dynamic_temporal_gnn.pt")
 SCALERS_PATH = os.path.join(MODELS_DIR, "gnn_scalers.pkl")
 
+import secrets
+import hmac
+import hashlib
+
+ADMIN_TOKEN = os.environ.get("CYBERGRAPH_ADMIN_TOKEN")
+if not ADMIN_TOKEN:
+    ADMIN_TOKEN = secrets.token_hex(24)
+
+HMAC_SECRET = os.environ.get("CYBERGRAPH_HMAC_SECRET")
+if not HMAC_SECRET:
+    HMAC_SECRET = secrets.token_hex(32)
+
+def get_admin_token() -> str:
+    """Return the active server admin authorization token."""
+    global ADMIN_TOKEN
+    return ADMIN_TOKEN
+
+def generate_signed_device_token(client_ip: str) -> str:
+    """Generate an HMAC-SHA256 authenticated device token bound to the client's IP."""
+    dev_uuid = str(uuid.uuid4())
+    ts = str(int(time.time()))
+    payload = f"{client_ip}:{dev_uuid}:{ts}"
+    sig = hmac.new(HMAC_SECRET.encode(), payload.encode(), hashlib.sha256).hexdigest()[:16]
+    return f"{dev_uuid}.{ts}.{sig}"
+
+def verify_signed_device_token(token: str, client_ip: str) -> bool:
+    """Cryptographically verify that the device token was signed by this server for this IP."""
+    if not token or not isinstance(token, str) or "." not in token:
+        return False
+    parts = token.split(".")
+    if len(parts) != 3:
+        return False
+    dev_uuid, ts, sig = parts
+    payload = f"{client_ip}:{dev_uuid}:{ts}"
+    expected_sig = hmac.new(HMAC_SECRET.encode(), payload.encode(), hashlib.sha256).hexdigest()[:16]
+    return hmac.compare_digest(sig, expected_sig)
+
+def sanitize_target_ip(raw: str) -> Optional[str]:
+    """Robustly sanitize and parse an IPv4/IPv6 target address from input."""
+    if not raw:
+        return None
+    val = str(raw).strip()
+    for pfx in ("HOST:", "SERVICE:", "EXTERNAL:", "GATEWAY:", "IP:"):
+        if val.upper().startswith(pfx):
+            val = val[len(pfx):].strip()
+    # Strip CIDR prefix length if present e.g. /32 or /128
+    if "/" in val:
+        val = val.split("/")[0].strip()
+    # Handle bracketed IPv6 with port e.g. [2001:db8::1]:8080
+    if val.startswith("[") and "]" in val:
+        val = val[1:val.index("]")]
+    elif ":" in val and val.count(":") == 1:
+        # IPv4 with port e.g. 192.168.1.1:80
+        val = val.split(":")[0].strip()
+    try:
+        ip_obj = ipaddress.ip_address(val)
+        return str(ip_obj)
+    except ValueError:
+        return None
+
 app = Flask(__name__)
 
 # --- Server-Authoritative Shared State & Thread Lock ---
@@ -202,6 +262,11 @@ def init_engines():
             _capture_initialized = False
 
         sync_network_state(force_scan=True)
+        srv_ip = get_server_local_ip()
+        if srv_ip:
+            fw_executor.add_protected_ip(srv_ip)
+        for gw in get_default_gateways():
+            fw_executor.add_protected_ip(gw)
 
         if not pipeline_thread_started:
             t = threading.Thread(target=_pipeline_worker, daemon=True, name="GlobalPipelineThread")
@@ -421,6 +486,7 @@ HTML_TEMPLATE = """
         </div>
         <div class="brand-container">
             <div class="data-source-badge" id="ds-badge">● DATA SOURCE: INITIALIZING NETWORK MONITOR...</div>
+            <button class="cyber-btn" id="btn-admin-auth" style="background:rgba(124, 58, 237, 0.2); border:1px solid var(--electric-purple); color:var(--electric-purple); font-size:10px; padding:6px 10px; margin:0; width:auto;" onclick="promptAdminToken()">🔑 ADMIN AUTH</button>
             <button class="cyber-btn export-btn" onclick="window.open('/api/export_report')">Export Audit Report</button>
         </div>
     </header>
@@ -601,6 +667,58 @@ HTML_TEMPLATE = """
     </div>
 
     <script>
+        let adminToken = localStorage.getItem('cybergraph_admin_token') || "{{ admin_token }}";
+        if (adminToken) {
+            localStorage.setItem('cybergraph_admin_token', adminToken);
+        }
+
+        function promptAdminToken() {
+            const current = localStorage.getItem('cybergraph_admin_token') || '';
+            const t = prompt('Enter CyberGraph Admin Access Token (from server startup console):', current);
+            if (t !== null) {
+                localStorage.setItem('cybergraph_admin_token', t.trim());
+                adminToken = t.trim();
+                alert('[CYBERGRAPH AUTH] Admin token saved successfully.');
+                updateDeviceAccessSection();
+            }
+        }
+
+        async function postAdmin(url, bodyObj = {}) {
+            let token = localStorage.getItem('cybergraph_admin_token') || adminToken;
+            let res;
+            try {
+                res = await fetch(url, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'X-Admin-Token': token || '',
+                        'X-CSRF-Token': token || '',
+                    },
+                    body: JSON.stringify(bodyObj)
+                });
+            } catch(e) {
+                throw e;
+            }
+
+            if (res.status === 403) {
+                const promptToken = prompt('[SECURITY 403 FORBIDDEN]\nEnter Admin Access Token to authenticate this action:');
+                if (promptToken) {
+                    localStorage.setItem('cybergraph_admin_token', promptToken.trim());
+                    adminToken = promptToken.trim();
+                    res = await fetch(url, {
+                        method: 'POST',
+                        headers: {
+                            'Content-Type': 'application/json',
+                            'X-Admin-Token': adminToken,
+                            'X-CSRF-Token': adminToken,
+                        },
+                        body: JSON.stringify(bodyObj)
+                    });
+                }
+            }
+            return res;
+        }
+
         const canvas = document.getElementById('graph-canvas');
         const ctx = canvas.getContext('2d');
         const sparkCanvas = document.getElementById('sparkline-canvas');
@@ -878,8 +996,9 @@ HTML_TEMPLATE = """
 
         async function executeRealBlock(targetIp) {
             const clean = sanitizeIp(targetIp);
+            if (!confirm(`Are you sure you want to block IP ${clean} in the OS Firewall?`)) return;
             try {
-                const res = await fetch(`/api/execute_real_block?ip=${encodeURIComponent(clean)}`);
+                const res = await postAdmin('/api/execute_real_block', { ip: clean });
                 const data = await res.json();
                 if (!res.ok) {
                     alert(`[FIREWALL ACTION ERROR ${res.status}]:\n${data.message || 'Block action failed'}`);
@@ -893,8 +1012,9 @@ HTML_TEMPLATE = """
 
         async function unblockIp(targetIp) {
             const clean = sanitizeIp(targetIp);
+            if (!confirm(`Are you sure you want to unblock IP ${clean}?`)) return;
             try {
-                const res = await fetch(`/api/unblock_ip?ip=${encodeURIComponent(clean)}`);
+                const res = await postAdmin('/api/unblock_ip', { ip: clean });
                 const data = await res.json();
                 if (!res.ok) {
                     alert(`[FIREWALL UNBLOCK ERROR ${res.status}]:\n${data.message || 'Unblock action failed'}`);
@@ -981,7 +1101,7 @@ HTML_TEMPLATE = """
 
         async function approveDevice(reqId) {
             try {
-                const res = await fetch(`/api/approve_device?request_id=${encodeURIComponent(reqId)}`, {method: 'POST'});
+                const res = await postAdmin('/api/approve_device', { request_id: reqId });
                 if (!res.ok) console.warn(`Approve device returned HTTP ${res.status}`);
             } catch(e) {
                 console.error("Approve device error", e);
@@ -992,7 +1112,7 @@ HTML_TEMPLATE = """
 
         async function revokeDevice(devId) {
             try {
-                const res = await fetch(`/api/revoke_device?device_id=${encodeURIComponent(devId)}`, {method: 'POST'});
+                const res = await postAdmin('/api/revoke_device', { device_id: devId });
                 if (!res.ok) console.warn(`Revoke device returned HTTP ${res.status}`);
             } catch(e) {
                 console.error("Revoke device error", e);
@@ -1073,24 +1193,33 @@ HTML_TEMPLATE = """
                 if (btnOff) btnOff.style.boxShadow = 'none';
             }
 
+            function setGraphTitle(accentColor, titleText) {
+                if (!graphTitle) return;
+                graphTitle.textContent = ' ' + titleText;
+                const acc = document.createElement('div');
+                acc.className = 'title-accent';
+                if (accentColor) acc.style.background = accentColor;
+                graphTitle.prepend(acc);
+            }
+
             if (data.stats.current_data_source.includes('LIVE')) {
                 if (data.stats.current_data_source.includes('DISCONNECTED') || data.stats.current_data_source.includes('NO PHYSICAL')) {
                     dsBadge.style.color = 'var(--warning-amber)';
                     dsBadge.style.borderColor = 'var(--warning-amber)';
-                    if (graphTitle) graphTitle.innerHTML = `<div class="title-accent" style="background:var(--warning-amber);"></div> Live Wi-Fi Standby (No Packets Captured)`;
+                    setGraphTitle('var(--warning-amber)', 'Live Wi-Fi Standby (No Packets Captured)');
                 } else {
                     dsBadge.style.color = 'var(--emerald-green)';
                     dsBadge.style.borderColor = 'var(--emerald-green)';
-                    if (graphTitle) graphTitle.innerHTML = `<div class="title-accent" style="background:var(--emerald-green);"></div> Live Wi-Fi Bipartite Graph Radar (HOST ↔ SERVICE)`;
+                    setGraphTitle('var(--emerald-green)', 'Live Wi-Fi Bipartite Graph Radar (HOST ↔ SERVICE)');
                 }
             } else if (data.stats.current_data_source.includes('ATTACK')) {
                 dsBadge.style.color = 'var(--critical-crimson)';
                 dsBadge.style.borderColor = 'var(--critical-crimson)';
-                if (graphTitle) graphTitle.innerHTML = `<div class="title-accent" style="background:var(--critical-crimson);"></div> Replay Attack Bipartite Graph Radar (HOST ↔ SERVICE)`;
+                setGraphTitle('var(--critical-crimson)', 'Replay Attack Bipartite Graph Radar (HOST ↔ SERVICE)');
             } else {
                 dsBadge.style.color = 'var(--neon-cyan)';
                 dsBadge.style.borderColor = 'var(--neon-cyan)';
-                if (graphTitle) graphTitle.innerHTML = `<div class="title-accent"></div> Offline Bipartite Graph Radar (NF-UNSW-NB15)`;
+                setGraphTitle('', 'Offline Bipartite Graph Radar (NF-UNSW-NB15)');
             }
 
             if (data.latencies) {
@@ -1292,18 +1421,18 @@ HTML_TEMPLATE = """
         }
 
         document.getElementById('btn-normal').addEventListener('click', async () => {
-            await fetch('/api/set_mode?mode=normal');
+            await postAdmin('/api/set_mode', { mode: 'normal' });
             await fetchStreamStep();
         });
         const btnOfflineEl = document.getElementById('btn-offline');
         if (btnOfflineEl) {
             btnOfflineEl.addEventListener('click', async () => {
-                await fetch('/api/set_mode?mode=offline');
+                await postAdmin('/api/set_mode', { mode: 'offline' });
                 await fetchStreamStep();
             });
         }
         document.getElementById('btn-attack').addEventListener('click', async () => {
-            await fetch('/api/set_mode?mode=attack');
+            await postAdmin('/api/set_mode', { mode: 'attack' });
             await fetchStreamStep();
         });
 
@@ -1451,7 +1580,7 @@ def discover_default_gateways() -> set:
         try:
             import subprocess
             out = subprocess.check_output(
-                "netstat -rn", shell=True, text=True, stderr=subprocess.DEVNULL
+                ["netstat", "-rn"], shell=False, text=True, stderr=subprocess.DEVNULL
             )
             for line in out.splitlines():
                 parts = line.strip().split()
@@ -1663,7 +1792,7 @@ def get_active_network_profile() -> dict:
     try:
         import subprocess
         out = subprocess.check_output(
-            "netstat -rn", shell=True, text=True, stderr=subprocess.DEVNULL
+            ["netstat", "-rn"], shell=False, text=True, stderr=subprocess.DEVNULL
         )
         for line in out.splitlines():
             parts = line.strip().split()
@@ -1830,7 +1959,7 @@ def discover_lan_neighbors(profile: Optional[dict] = None, arp_output: Optional[
     if out is None:
         try:
             import subprocess
-            out = subprocess.check_output("arp -a", shell=True, text=True, stderr=subprocess.DEVNULL)
+            out = subprocess.check_output(["arp", "-a"], shell=False, text=True, stderr=subprocess.DEVNULL)
         except Exception:
             out = ""
 
@@ -1916,7 +2045,7 @@ def get_mac_for_ip(ip_str: str) -> Optional[str]:
         return _arp_mac_map[clean_ip]
     try:
         import subprocess
-        out = subprocess.check_output("arp -a", shell=True, text=True, stderr=subprocess.DEVNULL)
+        out = subprocess.check_output(["arp", "-a"], shell=False, text=True, stderr=subprocess.DEVNULL)
         for line in out.splitlines():
             parts = line.strip().split()
             if len(parts) >= 2 and parts[0] == clean_ip:
@@ -2309,6 +2438,12 @@ def sync_network_state(force_scan: bool = False, profile_override: Optional[dict
         _default_gateways.clear()
         if gateway:
             _default_gateways.add(str(gateway))
+
+        if fw_executor:
+            if local_ip:
+                fw_executor.add_protected_ip(str(local_ip))
+            if gateway:
+                fw_executor.add_protected_ip(str(gateway))
 
         # Register server's own local IP as HOST (Requirement 4 & 12)
         _server_local_ip = str(local_ip) if local_ip else None
@@ -2992,14 +3127,27 @@ def _pipeline_worker():
 @app.route("/")
 def index():
     init_engines()
-    return render_template_string(HTML_TEMPLATE)
+    is_admin = is_admin_request()
+    client_ip = request.remote_addr or "127.0.0.1"
+    token_to_render = ADMIN_TOKEN if client_ip in ("127.0.0.1", "::1", "localhost") else ""
+    return render_template_string(HTML_TEMPLATE, admin_token=token_to_render, is_admin=is_admin)
 
 
-@app.route("/api/set_mode")
+@app.route("/api/set_mode", methods=["POST"])
 def set_mode():
     init_engines()
-    m = request.args.get("mode", "normal")
-    if m not in ("normal", "attack", "offline"):
+    if not is_admin_request():
+        logger.warning(f"[SECURITY 403] Unauthorized set_mode attempt from client IP: {request.remote_addr}")
+        return jsonify({
+            "status": "ERROR",
+            "message": "Forbidden: Administrative access required to change operating mode"
+        }), 403
+
+    m = request.args.get("mode")
+    if not m and request.is_json:
+        data = request.get_json(silent=True) or {}
+        m = data.get("mode")
+    if not m or m not in ("normal", "attack", "offline"):
         m = "normal"
     with state_lock:
         shared_state["mode"] = m
@@ -3428,7 +3576,7 @@ def export_report():
     return Response(report_html, mimetype="text/html")
 
 
-@app.route("/api/execute_real_block", methods=["GET", "POST"])
+@app.route("/api/execute_real_block", methods=["POST"])
 def execute_real_block():
     init_engines()
     if not is_admin_request():
@@ -3446,15 +3594,8 @@ def execute_real_block():
     if not target_ip:
         return jsonify({"status": "ERROR", "message": "Missing IP parameter."}), 400
 
-    clean_ip = str(target_ip).replace("HOST:", "").replace("SERVICE:", "").replace("EXTERNAL:", "").replace("GATEWAY:", "").strip()
-    if "/" in clean_ip:
-        clean_ip = clean_ip.split("/")[0]
-    if ":" in clean_ip and clean_ip.count(":") == 1:
-        clean_ip = clean_ip.split(":")[0]
-
-    try:
-        ipaddress.ip_address(clean_ip)
-    except ValueError:
+    clean_ip = sanitize_target_ip(target_ip)
+    if not clean_ip:
         return jsonify({"status": "ERROR", "message": f"Invalid IP address: '{target_ip}'"}), 400
 
     res = fw_executor.execute_block(clean_ip, force_real=True)
@@ -3465,7 +3606,7 @@ def execute_real_block():
     return jsonify(res)
 
 
-@app.route("/api/unblock_ip", methods=["GET", "POST"])
+@app.route("/api/unblock_ip", methods=["POST"])
 def api_unblock_ip():
     init_engines()
     if not is_admin_request():
@@ -3483,15 +3624,8 @@ def api_unblock_ip():
     if not target_ip:
         return jsonify({"status": "ERROR", "message": "Missing IP parameter."}), 400
 
-    clean_ip = str(target_ip).replace("HOST:", "").replace("SERVICE:", "").replace("EXTERNAL:", "").replace("GATEWAY:", "").strip()
-    if "/" in clean_ip:
-        clean_ip = clean_ip.split("/")[0]
-    if ":" in clean_ip and clean_ip.count(":") == 1:
-        clean_ip = clean_ip.split(":")[0]
-
-    try:
-        ipaddress.ip_address(clean_ip)
-    except ValueError:
+    clean_ip = sanitize_target_ip(target_ip)
+    if not clean_ip:
         return jsonify({"status": "ERROR", "message": f"Invalid IP address: '{target_ip}'"}), 400
 
     res = fw_executor.execute_unblock(clean_ip)
@@ -3505,15 +3639,8 @@ def api_verify_blocked():
     if not target_ip:
         return jsonify({"status": "ERROR", "message": "Missing IP parameter."}), 400
 
-    clean_ip = str(target_ip).replace("HOST:", "").replace("SERVICE:", "").replace("EXTERNAL:", "").replace("GATEWAY:", "").strip()
-    if "/" in clean_ip:
-        clean_ip = clean_ip.split("/")[0]
-    if ":" in clean_ip and clean_ip.count(":") == 1:
-        clean_ip = clean_ip.split(":")[0]
-
-    try:
-        ipaddress.ip_address(clean_ip)
-    except ValueError:
+    clean_ip = sanitize_target_ip(target_ip)
+    if not clean_ip:
         return jsonify({"status": "ERROR", "message": f"Invalid IP address: '{target_ip}'"}), 400
 
     return jsonify(fw_executor.verify_blocked(clean_ip))
@@ -3523,19 +3650,21 @@ def api_verify_blocked():
 def handle_device_access_request():
     if request.path.startswith("/static") or request.path.startswith("/favicon"):
         return
-    token = request.cookies.get("cybergraph_device_token")
-    if not token:
-        token = str(uuid.uuid4())
-        g.new_device_token = token
-    else:
-        g.new_device_token = None
 
     client_ip = request.remote_addr or "127.0.0.1"
-    # Never trust X-Forwarded-For from external clients to prevent spoofing
-    if request.headers.get("X-Forwarded-For") and client_ip in ("127.0.0.1", "::1", "localhost"):
+    # Never trust X-Forwarded-For unless explicitly configured via CYBERGRAPH_TRUST_PROXY=1
+    if os.environ.get("CYBERGRAPH_TRUST_PROXY") == "1" and request.headers.get("X-Forwarded-For"):
         fwd = request.headers.get("X-Forwarded-For").split(",")[0].strip()
         if fwd:
             client_ip = fwd
+
+    raw_token = request.cookies.get("cybergraph_device_token")
+    if not raw_token or not verify_signed_device_token(raw_token, client_ip):
+        token = generate_signed_device_token(client_ip)
+        g.new_device_token = token
+    else:
+        token = raw_token
+        g.new_device_token = None
 
     g.client_device_token = token
     g.client_ip = client_ip
@@ -3544,38 +3673,64 @@ def handle_device_access_request():
 
 
 @app.after_request
-def set_device_token_cookie(response):
+def set_security_headers_and_cookie(response):
     if hasattr(g, "new_device_token") and g.new_device_token:
+        is_secure = request.is_secure or request.headers.get("X-Forwarded-Proto") == "https"
         response.set_cookie(
             "cybergraph_device_token",
             g.new_device_token,
             max_age=30 * 86400,
             httponly=True,
-            samesite="Lax",
+            samesite="Strict",
+            secure=is_secure,
         )
+
+    # Security Headers to prevent framing, MIME sniffing, and unauthorized script injection
+    response.headers["Content-Security-Policy"] = (
+        "default-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net https://fonts.googleapis.com https://fonts.gstatic.com data:; "
+        "script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; "
+        "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; "
+        "font-src 'self' https://fonts.gstatic.com; "
+        "img-src 'self' data:; "
+        "connect-src 'self';"
+    )
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
     return response
 
 
 def is_admin_request() -> bool:
-    """Determine if current HTTP request originates from the authoritative CyberGraph Server/Admin."""
-    srv_ip = get_server_local_ip()
-    client_ip = request.remote_addr or "127.0.0.1"
+    """Determine if current HTTP request originates from authenticated CyberGraph Admin.
+    Validates token via:
+      1. X-Admin-Token or X-CSRF-Token header
+      2. Authorization: Bearer <token> header
+      3. cybergraph_admin_token cookie
+      4. JSON body or query param 'admin_token'
+      5. Explicit test environment bypass via CYBERGRAPH_ALLOW_LOCALHOST_ADMIN=1.
+    """
+    token_candidate = (
+        request.headers.get("X-Admin-Token")
+        or request.headers.get("X-CSRF-Token")
+        or request.cookies.get("cybergraph_admin_token")
+    )
+    if not token_candidate and request.headers.get("Authorization", "").startswith("Bearer "):
+        token_candidate = request.headers.get("Authorization", "")[7:].strip()
+    if not token_candidate and request.is_json:
+        data = request.get_json(silent=True) or {}
+        token_candidate = data.get("admin_token") or data.get("token")
+    if not token_candidate:
+        token_candidate = request.args.get("admin_token") or request.args.get("token")
 
-    # 1. Local loopback on the server host
-    if client_ip in ("127.0.0.1", "::1", "localhost", "0.0.0.0"):
+    if token_candidate and hmac.compare_digest(str(token_candidate).strip(), ADMIN_TOKEN):
         return True
 
-    # 2. Origin matches authoritative CyberGraph server local IP
-    if srv_ip and client_ip == srv_ip:
-        return True
-
-    # 3. Check if device token belongs to the registered server device
-    token = request.cookies.get("cybergraph_device_token")
-    if token:
-        with state_lock:
-            dev = _authorized_monitored_devices.get(token)
-            if dev and dev.get("is_server"):
-                return True
+    # Test environment bypass flag
+    if os.environ.get("CYBERGRAPH_ALLOW_LOCALHOST_ADMIN") == "1":
+        client_ip = request.remote_addr or "127.0.0.1"
+        srv_ip = get_server_local_ip()
+        if client_ip in ("127.0.0.1", "::1", "localhost", "0.0.0.0") or (srv_ip and client_ip == srv_ip):
+            return True
 
     return False
 
@@ -3591,7 +3746,7 @@ def api_device_requests():
     })
 
 
-@app.route("/api/approve_device", methods=["POST", "GET"])
+@app.route("/api/approve_device", methods=["POST"])
 def api_approve_device():
     init_engines()
     if not is_admin_request():
@@ -3617,7 +3772,7 @@ def api_approve_device():
     return jsonify({"status": "ERROR", "message": f"Pending request or device '{req_id}' not found"}), 404
 
 
-@app.route("/api/reject_device", methods=["POST", "GET"])
+@app.route("/api/reject_device", methods=["POST"])
 def api_reject_device():
     init_engines()
     if not is_admin_request():
@@ -3643,7 +3798,7 @@ def api_reject_device():
     return jsonify({"status": "ERROR", "message": f"Request '{req_id}' not found"}), 404
 
 
-@app.route("/api/revoke_device", methods=["POST", "GET"])
+@app.route("/api/revoke_device", methods=["POST"])
 def api_revoke_device():
     init_engines()
     if not is_admin_request():
@@ -3672,7 +3827,13 @@ def api_revoke_device():
 if __name__ == "__main__":
     init_engines()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-    print("\nStarting CYBERGRAPH COMMAND CENTER on http://127.0.0.1:5000 ...")
+    host = os.environ.get("CYBERGRAPH_HOST", "127.0.0.1")
+    port = int(os.environ.get("CYBERGRAPH_PORT", "5000"))
+    print("\n" + "=" * 72)
+    print("CYBERGRAPH COMMAND CENTER — INITIALIZED")
+    print(f"Server Binding : http://{host}:{port}")
+    print(f"[SECURITY] ADMIN TOKEN : {ADMIN_TOKEN}")
     print("Phase 2 MITRE ATT&CK integration: ACTIVE")
     print("Supported techniques: T1046, T1110, T1498")
-    app.run(host="0.0.0.0", port=5000, debug=False)
+    print("=" * 72 + "\n")
+    app.run(host=host, port=port, debug=False)

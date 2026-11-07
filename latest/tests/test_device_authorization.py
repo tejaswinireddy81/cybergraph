@@ -160,10 +160,12 @@ def test_g_only_admin_server_can_approve():
     friend_ip = "10.160.36.186"
     req = process_client_request(client_ip=friend_ip, device_token="token-admin-test")
 
-    # Admin from loopback (127.0.0.1) can approve
+    # Admin with valid admin token can approve
+    from app import get_admin_token
     res = client.post(
         "/api/approve_device",
         json={"request_id": req["request_id"]},
+        headers={"X-Admin-Token": get_admin_token()},
         environ_base={"REMOTE_ADDR": "127.0.0.1"}
     )
     assert res.status_code == 200
