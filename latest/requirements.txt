@@ -14,3 +14,4 @@ xgboost>=2.1.0
 shap>=0.46.0
 reportlab>=4.2.0
 waitress>=3.0.2
+websockets>=12.0

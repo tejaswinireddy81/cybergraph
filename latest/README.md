@@ -242,7 +242,7 @@ important caveat for how these numbers should be read in a viva/defense.
 
 ```bash
 pip install -r requirements.txt   # scikit-learn, tensorflow-cpu, torch, torch-geometric,
-                                    # scapy, dash, pandas, networkx, joblib
+                                    # scapy, flask, pandas, networkx, joblib
 
 # 1. Train the per-flow detectors (RF + Autoencoder)
 python train_models.py
@@ -256,6 +256,28 @@ python train_fusion.py
 # 4. Launch the live dashboard
 python app.py
 ```
+
+### 6.0 Security setup (read before exposing the dashboard)
+
+- **Admin login.** On start the console prints `ADMIN TOKEN`. Click **ADMIN AUTH** in the
+  dashboard and paste it. This creates an HttpOnly, SameSite=Strict session cookie plus a CSRF
+  token held in memory; the token itself is never stored in the browser. Set your own with
+  `CYBERGRAPH_ADMIN_TOKEN` (recommended) and `CYBERGRAPH_HMAC_SECRET`; otherwise random
+  secrets are generated once and kept in `config/.secrets.json` (gitignored, owner-only).
+- **Network binding.** The server binds to `127.0.0.1` by default. Set `CYBERGRAPH_HOST=0.0.0.0`
+  only on a trusted LAN; read-only APIs then require an approved device, and every
+  state-changing route requires admin session + CSRF.
+- **Reverse proxy.** `X-Forwarded-For` is ignored unless `CYBERGRAPH_TRUST_PROXY=1`.
+- **Model integrity.** Models load only if their SHA-256 matches `models/model_manifest.json`
+  (fail-closed). After retraining, regenerate the manifest (`python scripts/setup_pipeline.py`).
+  `CYBERGRAPH_ALLOW_UNVERIFIED_MODELS=1` is for local experiments only and is ignored when
+  `CYBERGRAPH_ENV=production`.
+- **Firewall actions.** The *Execute Real OS Block* button runs a real `netsh`/`iptables` rule
+  (Windows asks for UAC approval) after a confirmation dialog. Gateway/DNS/loopback addresses
+  are protected, and unblock reports failure if the rule is still present.
+- **Tests never touch your firewall** (`tests/conftest.py` fakes `netsh`/`iptables`).
+  `tests/test_browser_smoke.py` drives the real dashboard in headless Chrome/Edge and is
+  skipped when no browser or trained models are present.
 
 ### 6.1 Live deployment against many real devices over the internet
 
