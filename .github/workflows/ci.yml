@@ -60,6 +60,10 @@ jobs:
       run: |
         flake8 routes modules response config --count --max-line-length=127 --extend-ignore=E203,W503 --statistics
 
+    - name: Dashboard JS syntax check
+      run: |
+        node --check static/js/app.js
+
     - name: Run Pytest suite
       run: |
         pytest tests/ -v

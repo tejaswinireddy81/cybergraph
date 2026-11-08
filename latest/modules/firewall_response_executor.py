@@ -112,6 +112,9 @@ class FirewallResponseExecutor:
         clean_ip = ip_address.strip()
         is_sim_blocked = clean_ip in self.simulated_acl_blocked_ips
         is_real_blocked = clean_ip in self.active_os_firewall_rules
+        if self.os_type == "windows" and (is_real_blocked or self.enable_real_blocking):
+            # Ground truth: ask the OS rather than trusting in-memory bookkeeping.
+            is_real_blocked = self._windows_rule_exists(f"Block-GNN-{clean_ip}")
         rule_active = is_sim_blocked or is_real_blocked
 
         return {
@@ -198,12 +201,13 @@ class FirewallResponseExecutor:
                 rule_name = f"Block-GNN-{clean_ip}"
                 ps_args = [
                     "powershell", "-NoProfile", "-NonInteractive", "-Command",
-                    f"Start-Process netsh -Verb RunAs -ArgumentList 'advfirewall firewall add rule name=\"{rule_name}\" dir=in action=block remoteip={clean_ip}'"
+                    f"Start-Process netsh -Wait -Verb RunAs -ArgumentList 'advfirewall firewall add rule name=\"{rule_name}\" dir=in action=block remoteip={clean_ip}'"
                 ]
                 print(f"[FIREWALL EXECUTOR] Triggering Windows Admin Elevation: {rule_name} ...", flush=True)
-                res_ps = subprocess.run(ps_args, shell=False, capture_output=True, text=True, timeout=10)
+                res_ps = subprocess.run(ps_args, shell=False, capture_output=True, text=True, timeout=60)
 
-                if res_ps.returncode == 0:
+                # Start-Process returning 0 only means the launcher ran; confirm the rule really exists.
+                if res_ps.returncode == 0 and self._windows_rule_exists(rule_name):
                     self.active_os_firewall_rules[clean_ip] = preview["unblock_command_preview"]
                     self.simulated_acl_blocked_ips.add(clean_ip)
                     ret = {
@@ -221,7 +225,7 @@ class FirewallResponseExecutor:
                         "execution_mode": "SIMULATED_MEMORY_ACTIVE",
                         "ip_address": clean_ip,
                         "message": f"Simulated Block Active for {clean_ip}! Real OS firewall rule requires Administrator approval.",
-                        "error": res_ps.stderr.strip() or "Access Denied",
+                        "error": res_ps.stderr.strip() or "Administrator approval was declined or the rule was not created",
                         "verification": self.verify_blocked(clean_ip),
                     }
             else:
@@ -256,6 +260,17 @@ class FirewallResponseExecutor:
         })
         return ret
 
+    def _windows_rule_exists(self, rule_name):
+        """Return True if a Windows Firewall rule with this exact name exists."""
+        try:
+            r = subprocess.run(
+                ["netsh", "advfirewall", "firewall", "show", "rule", f"name={rule_name}"],
+                shell=False, capture_output=True, text=True, timeout=10,
+            )
+            return r.returncode == 0 and "No rules match" not in r.stdout
+        except Exception:
+            return False
+
     def execute_unblock(self, ip_address):
         """Removes a real or simulated firewall block rule using shell=False."""
         if not self.validate_ip(ip_address):
@@ -272,16 +287,45 @@ class FirewallResponseExecutor:
         had_real_rule = clean_ip in self.active_os_firewall_rules
         self.active_os_firewall_rules.pop(clean_ip, None)
 
+        os_failure = None
         if had_real_rule or self.enable_real_blocking:
             try:
                 if self.os_type == "windows":
                     rule_name = f"Block-GNN-{clean_ip}"
-                    cmd_args = ["netsh", "advfirewall", "firewall", "delete", "rule", f"name={rule_name}"]
+                    if self._windows_rule_exists(rule_name):
+                        cmd_args = ["netsh", "advfirewall", "firewall", "delete", "rule", f"name={rule_name}"]
+                        res = subprocess.run(cmd_args, shell=False, capture_output=True, text=True, timeout=5)
+                        if res.returncode != 0 and self._windows_rule_exists(rule_name):
+                            # Not elevated: retry through a UAC prompt, then confirm it is really gone.
+                            ps_args = [
+                                "powershell", "-NoProfile", "-NonInteractive", "-Command",
+                                f"Start-Process netsh -Wait -Verb RunAs -ArgumentList 'advfirewall firewall delete rule name=\"{rule_name}\"'",
+                            ]
+                            subprocess.run(ps_args, shell=False, capture_output=True, text=True, timeout=60)
+                        if self._windows_rule_exists(rule_name):
+                            os_failure = "OS firewall rule still present (Administrator approval required to delete it)."
                 else:
                     cmd_args = ["iptables", "-D", "INPUT", "-s", clean_ip, "-j", "DROP"]
-                subprocess.run(cmd_args, shell=False, capture_output=True, text=True, timeout=5)
+                    res = subprocess.run(cmd_args, shell=False, capture_output=True, text=True, timeout=5)
+                    if res.returncode != 0:
+                        os_failure = res.stderr.strip() or "iptables delete failed (requires root)."
             except Exception as e:
                 logger.error(f"Failed to unblock {clean_ip}: {e}")
+                os_failure = str(e)
+
+        if os_failure:
+            # Keep tracking the rule so the operator can retry, and report the truth.
+            self.active_os_firewall_rules[clean_ip] = f"retry unblock {clean_ip}"
+            ret = {
+                "status": "UNBLOCK_FAILED",
+                "ip_address": clean_ip,
+                "message": f"Could not remove OS firewall rule for {clean_ip}: {os_failure}",
+                "verification": self.verify_blocked(clean_ip),
+            }
+            self.action_history.append({
+                "action": "UNBLOCK", "ip": clean_ip, "status": ret["status"], "timestamp": time.time(),
+            })
+            return ret
 
         ret = {
             "status": "UNBLOCKED_SUCCESS",

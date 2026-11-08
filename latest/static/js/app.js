@@ -1,5 +1,7 @@
-let adminToken = localStorage.getItem('cybergraph_admin_token') || '';
+// SECURITY: the admin token is never stored in browser storage. Auth is an HttpOnly
+// session cookie plus a per-session CSRF token held in memory only.
 let csrfToken = '';
+try { localStorage.removeItem('cybergraph_admin_token'); } catch (e) {}
 
 async function fetchCsrfToken() {
     try {
@@ -15,58 +17,31 @@ async function fetchCsrfToken() {
     }
 }
 fetchCsrfToken();
-        if (adminToken) {
-            localStorage.setItem('cybergraph_admin_token', adminToken);
-        }
-
         function promptAdminToken() {
-            const current = localStorage.getItem('cybergraph_admin_token') || '';
-            const t = prompt('Enter CyberGraph Admin Access Token (from server startup console):', current);
-            if (t !== null) {
-                localStorage.setItem('cybergraph_admin_token', t.trim());
-                adminToken = t.trim();
-                alert('[CYBERGRAPH AUTH] Admin token saved successfully.');
-                updateDeviceAccessSection();
-            }
+            openAdminAuthModal();
         }
 
         async function postAdmin(url, bodyObj = {}) {
-            let token = localStorage.getItem('cybergraph_admin_token') || adminToken;
             if (!csrfToken) {
                 await fetchCsrfToken();
             }
-            let res;
-            const headers = {
-                'Content-Type': 'application/json',
-                'X-CSRF-Token': csrfToken || '',
-            };
-            if (token) {
-                headers['X-Admin-Token'] = token;
-                headers['Authorization'] = 'Bearer ' + token;
-            }
+            const doFetch = () => fetch(url, {
+                method: 'POST',
+                credentials: 'same-origin',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'X-CSRF-Token': csrfToken || '',
+                },
+                body: JSON.stringify(bodyObj)
+            });
 
-            try {
-                res = await fetch(url, {
-                    method: 'POST',
-                    headers: headers,
-                    body: JSON.stringify(bodyObj)
-                });
-            } catch(e) {
-                throw e;
-            }
-
+            let res = await doFetch();
             if (res.status === 403) {
-                const promptToken = prompt('[SECURITY 403 FORBIDDEN]\nEnter Admin Access Token to authenticate this action:');
-                if (promptToken) {
-                    localStorage.setItem('cybergraph_admin_token', promptToken.trim());
-                    adminToken = promptToken.trim();
-                    headers['X-Admin-Token'] = adminToken;
-                    headers['Authorization'] = 'Bearer ' + adminToken;
-                    res = await fetch(url, {
-                        method: 'POST',
-                        headers: headers,
-                        body: JSON.stringify(bodyObj)
-                    });
+                // Session expired or CSRF token stale: refresh the token once and retry.
+                await fetchCsrfToken();
+                res = await doFetch();
+                if (res.status === 403) {
+                    openAdminAuthModal();
                 }
             }
             return res;
@@ -732,13 +707,7 @@ fetchCsrfToken();
 
         async function refreshBlockHistory() {
             try {
-                let token = localStorage.getItem('cybergraph_admin_token') || adminToken;
-                const headers = {};
-                if (token) {
-                    headers['Authorization'] = 'Bearer ' + token;
-                    headers['X-Admin-Token'] = token;
-                }
-                const res = await fetch('/api/blocks/history', { headers: headers });
+                const res = await fetch('/api/blocks/history', { credentials: 'same-origin' });
                 if (!res.ok) {
                     const el = document.getElementById('blocked-ips-container');
                     if (el) el.innerHTML = `<span style="color:var(--warning-amber);">Failed to load blocks (HTTP ${res.status}). Authenticate as admin.</span>`;
@@ -1105,24 +1074,11 @@ fetchCsrfToken();
 
         function handleStreamData(data) {
             if (!data || !data.stats) return;
-            if (isPolling) return;
-            isPolling = true;
-
-            let data;
             try {
-                const res = await fetch('/api/stream_step');
-                if (!res.ok) {
-                    console.warn(`Stream step HTTP ${res.status}`);
-                    return;
-                }
-                data = await res.json();
-            } catch(e) {
-                console.error("Stream step network error:", e);
-                return;
-            } finally {
-                isPolling = false;
+                _handleStreamDataInner(data);
+            } catch (e) {
+                console.error("Stream render error:", e);
             }
-
         }
 
         async function fetchStreamStep() {
@@ -1144,6 +1100,98 @@ fetchCsrfToken();
             } finally {
                 isPolling = false;
             }
+        }
+
+        function updateGraphLayout(data) {
+            if (!data.graph_nodes || !data.graph_edges) return;
+            // PERFECT DYNAMIC BIPARTITE GRAPH FIT
+            // Left column: HOST + GATEWAY + EXTERNAL nodes  |  Right column: SERVICE nodes
+            const hostNodes = sortNodes(data.graph_nodes.filter(n => n.type === 'HOST'));
+            const gatewayNodes = sortNodes(data.graph_nodes.filter(n => n.type === 'GATEWAY'));
+            const externalNodes = sortNodes(data.graph_nodes.filter(n => n.type === 'EXTERNAL'));
+            const serviceNodes = sortNodes(data.graph_nodes.filter(n => n.type === 'SERVICE'));
+
+            // All left-side nodes combined (HOSTs first, then GATEWAY, then EXTERNALs)
+            const leftNodes = [...hostNodes, ...gatewayNodes, ...externalNodes];
+
+            const marginX = Math.max(140, Math.min(220, canvas.width * 0.28));
+            const hostX = marginX;
+            const serviceX = canvas.width - marginX;
+
+            const topPad = 60;
+            const bottomPad = 60;
+            const availH = canvas.height - topPad - bottomPad;
+
+            const lCount = leftNodes.length;
+            const sCount = serviceNodes.length;
+
+            const newNodePosMap = {};
+
+            // Distribute all left-column nodes (HOST + GATEWAY + EXTERNAL) vertically with generous padding
+            leftNodes.forEach((n, idx) => {
+                const y = lCount <= 1 ? canvas.height / 2 : topPad + idx * (availH / (lCount - 1));
+                newNodePosMap[n.label] = { x: hostX, y: y };
+            });
+
+            serviceNodes.forEach((s, idx) => {
+                const y = sCount <= 1 ? canvas.height / 2 : topPad + idx * (availH / (sCount - 1));
+                newNodePosMap[s.label] = { x: serviceX, y: y };
+            });
+
+            nodePosMap = newNodePosMap;
+
+            nodes = data.graph_nodes.map(n => ({
+                label: n.label,
+                type: n.type,
+                threat_level: n.threat_level || 'NORMAL',
+                color: n.color || 'normal',
+                x: nodePosMap[n.label] ? nodePosMap[n.label].x : ((n.type === 'HOST' || n.type === 'GATEWAY' || n.type === 'EXTERNAL') ? hostX : serviceX),
+                y: nodePosMap[n.label] ? nodePosMap[n.label].y : canvas.height / 2,
+            }));
+
+            // Restrained Edge Routing: Prefer mostly straight lines; small ±12px offset only for multiple overlapping edges between same pair
+            const edgePairCounts = {};
+            const edgePairIndices = {};
+
+            data.graph_edges.forEach(e => {
+                const pairKey = `${e.source_label}->${e.target_label}`;
+                edgePairCounts[pairKey] = (edgePairCounts[pairKey] || 0) + 1;
+            });
+
+            edges = data.graph_edges.map(e => {
+                const pairKey = `${e.source_label}->${e.target_label}`;
+                const idx = edgePairIndices[pairKey] || 0;
+                edgePairIndices[pairKey] = idx + 1;
+                const total = edgePairCounts[pairKey];
+
+                const srcPos = nodePosMap[e.source_label] || { x: hostX, y: canvas.height / 2 };
+                const dstPos = nodePosMap[e.target_label] || { x: serviceX, y: canvas.height / 2 };
+
+                const midX = (srcPos.x + dstPos.x) / 2;
+                const midY = (srcPos.y + dstPos.y) / 2;
+
+                // Restrained curve offset: 0 for single edges (straight line!), ±14px max for duplicate parallel edges
+                let curveOffset = 0;
+                if (total > 1) {
+                    const rawOffset = (idx - (total - 1) / 2) * 14;
+                    curveOffset = Math.max(-18, Math.min(18, rawOffset));
+                }
+
+                return {
+                    x1: srcPos.x, y1: srcPos.y,
+                    x2: dstPos.x, y2: dstPos.y,
+                    controlX: midX,
+                    controlY: midY + curveOffset,
+                    risk: e.risk, color: e.color || 'normal', level: e.level || 'NORMAL'
+                };
+            });
+
+            particles = edges.map(e => ({
+                x1: e.x1, y1: e.y1, x2: e.x2, y2: e.y2,
+                controlX: e.controlX, controlY: e.controlY,
+                risk: e.risk, color: e.color,
+                progress: Math.random(), speed: 0.004 + e.risk * 0.012
+            }));
         }
 
         function _handleStreamDataInner(data) {
@@ -1249,382 +1297,10 @@ fetchCsrfToken();
                 drawSparkline();
             }
             updateAllCharts(data);
+            updateGraphLayout(data);
 
             currentEvals = data.evals || [];
             renderFilteredAlerts();
-
-            const cntEl = document.getElementById('threat-feed-count');
-            if (cntEl) cntEl.innerText = `${visibleCount} events`;
-        }
-
-        let isPolling = false;
-        let lastDeviceStateVersion = -1;
-        let lastDevicePollTime = 0;
-
-        function handleStreamData(data) {
-            if (!data || !data.stats) return;
-            if (isPolling) return;
-            isPolling = true;
-
-            let data;
-            try {
-                const res = await fetch('/api/stream_step');
-                if (!res.ok) {
-                    console.warn(`Stream step HTTP ${res.status}`);
-                    return;
-                }
-                data = await res.json();
-            } catch(e) {
-                console.error("Stream step network error:", e);
-                return;
-            } finally {
-                isPolling = false;
-            }
-
-        }
-
-        async function fetchStreamStep() {
-            if (isPolling) return;
-            isPolling = true;
-
-            try {
-                const res = await fetch('/api/stream_step');
-                if (!res.ok) {
-                    showConnectionBanner();
-                    return;
-                }
-                hideConnectionBanner();
-                const data = await res.json();
-                handleStreamData(data);
-            } catch(e) {
-                console.error("Stream step network error:", e);
-                showConnectionBanner();
-            } finally {
-                isPolling = false;
-            }
-        }
-
-        function _handleStreamDataInner(data) {
-            // Avoid unnecessary repeated device-access calls:
-            // Only update device section if state_version changed or periodically after 10s
-            const nowTime = Date.now();
-            if (data.state_version !== lastDeviceStateVersion || (nowTime - lastDevicePollTime) > 10000) {
-                lastDeviceStateVersion = data.state_version;
-                lastDevicePollTime = nowTime;
-                updateDeviceAccessSection();
-            }
-
-            if (data.state_version) {
-                document.getElementById('version-tag').innerText = `STATE V: ${data.state_version}`;
-            }
-
-            document.getElementById('val-total').innerText = data.stats.total_flows;
-            document.getElementById('val-l1').innerText = data.stats.level1_normal;
-            document.getElementById('val-l2').innerText = data.stats.level2_suspicious;
-            document.getElementById('val-l3').innerText = data.stats.level3_critical;
-            document.getElementById('val-hosts').innerText = data.stats.active_hosts;
-            document.getElementById('val-services').innerText = data.stats.active_services;
-            document.getElementById('val-risk').innerText = data.stats.current_risk.toFixed(4);
-
-            const dsBadge = document.getElementById('ds-badge');
-            const graphTitle = document.getElementById('graph-panel-title');
-            dsBadge.innerText = `● DATA SOURCE: ${data.stats.current_data_source}`;
-
-            if (data.stats.live_buffer_count !== undefined) {
-                document.getElementById('cap-buf').innerText = `${data.stats.live_buffer_count} Packets`;
-            }
-
-            const btnAtk = document.getElementById('btn-attack');
-            const btnNorm = document.getElementById('btn-normal');
-            const btnOff = document.getElementById('btn-offline');
-
-            if (data.mode === 'attack') {
-                if (btnAtk) btnAtk.style.boxShadow = '0 0 15px rgba(255, 0, 85, 0.6)';
-                if (btnNorm) btnNorm.style.boxShadow = 'none';
-                if (btnOff) btnOff.style.boxShadow = 'none';
-            } else if (data.mode === 'offline') {
-                if (btnOff) btnOff.style.boxShadow = '0 0 15px rgba(14, 165, 233, 0.8)';
-                if (btnNorm) btnNorm.style.boxShadow = 'none';
-                if (btnAtk) btnAtk.style.boxShadow = 'none';
-            } else {
-                if (btnNorm) btnNorm.style.boxShadow = '0 0 15px rgba(0, 255, 157, 0.6)';
-                if (btnAtk) btnAtk.style.boxShadow = 'none';
-                if (btnOff) btnOff.style.boxShadow = 'none';
-            }
-
-            function setGraphTitle(accentColor, titleText) {
-                if (!graphTitle) return;
-                graphTitle.textContent = ' ' + titleText;
-                const acc = document.createElement('div');
-                acc.className = 'title-accent';
-                if (accentColor) acc.style.background = accentColor;
-                graphTitle.prepend(acc);
-            }
-
-            if (data.stats.current_data_source.includes('LIVE')) {
-                if (data.stats.current_data_source.includes('DISCONNECTED') || data.stats.current_data_source.includes('NO PHYSICAL')) {
-                    dsBadge.style.color = 'var(--warning-amber)';
-                    dsBadge.style.borderColor = 'var(--warning-amber)';
-                    setGraphTitle('var(--warning-amber)', 'Live Wi-Fi Standby (No Packets Captured)');
-                } else {
-                    dsBadge.style.color = 'var(--emerald-green)';
-                    dsBadge.style.borderColor = 'var(--emerald-green)';
-                    setGraphTitle('var(--emerald-green)', 'Live Wi-Fi Bipartite Graph Radar (HOST ↔ SERVICE)');
-                }
-            } else if (data.stats.current_data_source.includes('ATTACK')) {
-                dsBadge.style.color = 'var(--critical-crimson)';
-                dsBadge.style.borderColor = 'var(--critical-crimson)';
-                setGraphTitle('var(--critical-crimson)', 'Replay Attack Bipartite Graph Radar (HOST ↔ SERVICE)');
-            } else {
-                dsBadge.style.color = 'var(--neon-cyan)';
-                dsBadge.style.borderColor = 'var(--neon-cyan)';
-                setGraphTitle('', 'Offline Bipartite Graph Radar (NF-UNSW-NB15)');
-            }
-
-            if (data.latencies) {
-                document.getElementById('lat-cap').innerText = data.latencies.capture.toFixed(2);
-                document.getElementById('lat-prep').innerText = data.latencies.feature_prep.toFixed(2);
-                document.getElementById('lat-gnn').innerText = data.latencies.gnn_infer.toFixed(2);
-                document.getElementById('lat-tot').innerText = data.latencies.total.toFixed(2);
-                document.getElementById('val-lat').innerText = `${data.latencies.total.toFixed(2)} ms`;
-            }
-
-            if (data.pipeline_metrics) {
-                const elXgb = document.getElementById('m-xgb');
-                if (elXgb) elXgb.innerText = data.pipeline_metrics.xgb_prob.toFixed(4);
-                const elAe = document.getElementById('m-ae');
-                if (elAe) elAe.innerText = data.pipeline_metrics.ae_score.toFixed(4);
-                const elFus = document.getElementById('m-fus');
-                if (elFus) elFus.innerText = data.pipeline_metrics.fusion_score.toFixed(4);
-                const elGnn = document.getElementById('m-gnn');
-                if (elGnn) elGnn.innerText = data.pipeline_metrics.gnn_risk.toFixed(4);
-                const elFin = document.getElementById('m-fin');
-                if (elFin) elFin.innerText = data.pipeline_metrics.final_tier;
-            }
-
-            if (data.stats.risk_history) {
-                riskHistory = data.stats.risk_history;
-                drawSparkline();
-            }
-
-            const feed = document.getElementById('alert-feed');
-            feed.innerHTML = '';
-
-            data.evals.forEach(ev => {
-                const isNormal = ev.level && ev.level.includes('Level 1');
-                const card = document.createElement('div');
-                card.className = `threat-card ${isNormal ? 'lvl-1' : (ev.level.includes('Level 2') ? 'lvl-2' : 'lvl-3')}`;
-
-                const safeLvl = escapeHtml(ev.level || 'Unknown');
-                const safeBadge = escapeHtml(ev.badge_color || '#10b981');
-                const safeSrc = escapeHtml(ev.source_host || '-');
-                const safeDst = escapeHtml(ev.target_service || '-');
-                const safeSummary = escapeHtml(ev.summary || '');
-                const safeRisk = Number(ev.risk_score || 0).toFixed(4);
-
-                let html = `
-                    <div style="display:flex; justify-content:space-between; margin-bottom:4px;">
-                        <strong>${safeLvl}</strong>
-                        <span style="background:${safeBadge}; color:#000; padding:2px 6px; border-radius:4px; font-weight:700;">Risk: ${safeRisk}</span>
-                    </div>
-                    <div><strong>Src:</strong> ${safeSrc} &rarr; <strong>Dst:</strong> ${safeDst}</div>
-                    <div style="margin-top:4px; color:var(--text-muted);">${safeSummary}</div>
-                `;
-
-                if (!isNormal && ev.xai_explanation && ev.xai_explanation.why_this_attack_reasons) {
-                    const reasons = ev.xai_explanation.why_this_attack_reasons;
-                    html += `
-                        <div class="why-attack-box">
-                            <div class="why-title">WHY THIS ATTACK? (SHAP & SALIENCY)</div>
-                            ${reasons.map(r => `<div>${escapeHtml(r)}</div>`).join('')}
-                        </div>
-                    `;
-                }
-
-                if (!isNormal && ev.bipartite_attack_chain) {
-                    const safeChain = ev.bipartite_attack_chain.map(c => escapeHtml(c)).join(' &rarr; ');
-                    html += `<div style="margin-top:6px; font-family:'JetBrains Mono'; font-size:10px; color:#ff99bb;"><strong>Attack Chain:</strong><br>${safeChain}</div>`;
-
-                if (!isNormal && ev.xai_explanation) {
-                    const xai = ev.xai_explanation;
-                    const topShap = xai.shap_top_features || [];
-                    const attributions = xai.feature_attributions || {};
-                    let shapItems = [];
-                    if (topShap.length > 0) {
-                        shapItems = topShap.slice(0, 4).map(item => ({
-                            name: Array.isArray(item) ? item[0] : (item.name || 'Feature'),
-                            val: Array.isArray(item) ? item[1] : (item.val || 0),
-                        }));
-                    } else if (Object.keys(attributions).length > 0) {
-                        shapItems = Object.entries(attributions)
-                            .sort((a, b) => Math.abs(b[1]) - Math.abs(a[1]))
-                            .slice(0, 4)
-                            .map(([name, val]) => ({ name, val }));
-                    }
-
-                    if (shapItems.length > 0) {
-                        html += `
-                            <div style="margin-top:6px; background:rgba(0,0,0,0.5); border:1px solid rgba(0, 240, 255, 0.25); border-radius:6px; padding:6px 8px;">
-                                <div style="font-family:'Space Grotesk',sans-serif; font-size:9px; font-weight:700; color:var(--neon-cyan); margin-bottom:4px; display:flex; justify-content:space-between;">
-                                    <span>SHAP TOP-FEATURE DRIVERS</span>
-                                    <span style="color:var(--text-muted); font-size:8px;">XAI SALIENCY</span>
-                                </div>
-                                ${shapItems.map(item => {
-                                    const fName = escapeHtml(String(item.name || ''));
-                                    const fValNum = Number(item.val || 0);
-                                    const fValStr = (fValNum >= 0 ? '+' : '') + fValNum.toFixed(4);
-                                    const pct = Math.min(100, Math.max(12, Math.abs(fValNum) * 100));
-                                    const barColor = fValNum >= 0 ? 'var(--critical-crimson)' : 'var(--emerald-green)';
-                                    return `
-                                        <div style="margin:2px 0; font-family:'JetBrains Mono',monospace; font-size:9px;">
-                                            <div style="display:flex; justify-content:space-between; margin-bottom:1px;">
-                                                <span>${fName}</span>
-                                                <span style="color:${barColor}; font-weight:700;">${fValStr}</span>
-                                            </div>
-                                            <div style="width:100%; height:3px; background:rgba(255,255,255,0.1); border-radius:2px; overflow:hidden;">
-                                                <div style="width:${pct}%; height:100%; background:${barColor};"></div>
-                                            </div>
-                                        </div>
-                                    `;
-                                }).join('')}
-                            </div>
-                        `;
-                    }
-                }
-
-                }
-
-                if (!isNormal && ev.mitre_mappings && ev.mitre_mappings.length > 0) {
-                    html += `<div class="mitre-section">`;
-                    html += `<div style="color:var(--mitre-blue); font-weight:700; margin-bottom:4px;">MITRE ATT&CK Techniques Detected:</div>`;
-                    ev.mitre_mappings.forEach(m => {
-                        const safeTechId = escapeHtml(m.technique_id || '');
-                        const safeTechName = escapeHtml(m.technique_name || '');
-                        const safeConf = (Number(m.confidence || 0) * 100).toFixed(1);
-                        const safeRationale = escapeHtml(m.rationale || '');
-                        const safeTactic = escapeHtml(m.tactic || '');
-
-                        html += `<div style="margin:4px 0;">`;
-                        html += `<span class="mitre-badge">${safeTechId}</span> `;
-                        html += `<span style="color:var(--text-main);">${safeTechName}</span> `;
-                        html += `<span class="mitre-confidence">${safeConf}%</span>`;
-                        html += `</div>`;
-                        if (safeRationale) {
-                            html += `<div class="mitre-rationale">${safeRationale}</div>`;
-                        }
-                        if (safeTactic) {
-                            html += `<div style="color:var(--text-muted); font-size:8px;">Tactic: ${safeTactic}</div>`;
-                        }
-                    });
-                    html += `</div>`;
-                }
-
-                if (!isNormal && ev.recommended_firewall_action) {
-                    const fw = ev.recommended_firewall_action;
-                    const ipClean = sanitizeIp(fw.target_ip || '');
-                    const safePreview = escapeHtml(fw.windows_netsh_rule_preview || '');
-                    html += `
-                        <div style="margin-top:8px;">
-                            <strong style="color:var(--critical-crimson);">Recommended Block Action (Simulated Response):</strong>
-                            <div class="cmd-box">${safePreview}</div>
-                            <button class="cyber-btn real-fw-btn" data-action="real-block" data-ip="${ipClean}">Admin Approval: Execute Real OS Firewall Rule</button>
-                            <button class="cyber-btn unblock-btn" data-action="unblock" data-ip="${ipClean}">Admin Action: Unblock IP</button>
-                        </div>
-                    `;
-                }
-
-                card.innerHTML = html;
-                feed.appendChild(card);
-            });
-
-            // PERFECT DYNAMIC BIPARTITE GRAPH FIT
-            // Left column: HOST + GATEWAY + EXTERNAL nodes  |  Right column: SERVICE nodes
-            const hostNodes = sortNodes(data.graph_nodes.filter(n => n.type === 'HOST'));
-            const gatewayNodes = sortNodes(data.graph_nodes.filter(n => n.type === 'GATEWAY'));
-            const externalNodes = sortNodes(data.graph_nodes.filter(n => n.type === 'EXTERNAL'));
-            const serviceNodes = sortNodes(data.graph_nodes.filter(n => n.type === 'SERVICE'));
-
-            // All left-side nodes combined (HOSTs first, then GATEWAY, then EXTERNALs)
-            const leftNodes = [...hostNodes, ...gatewayNodes, ...externalNodes];
-
-            const marginX = Math.max(140, Math.min(220, canvas.width * 0.28));
-            const hostX = marginX;
-            const serviceX = canvas.width - marginX;
-
-            const topPad = 60;
-            const bottomPad = 60;
-            const availH = canvas.height - topPad - bottomPad;
-
-            const lCount = leftNodes.length;
-            const sCount = serviceNodes.length;
-
-            const newNodePosMap = {};
-
-            // Distribute all left-column nodes (HOST + GATEWAY + EXTERNAL) vertically with generous padding
-            leftNodes.forEach((n, idx) => {
-                const y = lCount <= 1 ? canvas.height / 2 : topPad + idx * (availH / (lCount - 1));
-                newNodePosMap[n.label] = { x: hostX, y: y };
-            });
-
-            serviceNodes.forEach((s, idx) => {
-                const y = sCount <= 1 ? canvas.height / 2 : topPad + idx * (availH / (sCount - 1));
-                newNodePosMap[s.label] = { x: serviceX, y: y };
-            });
-
-            nodePosMap = newNodePosMap;
-
-            nodes = data.graph_nodes.map(n => ({
-                label: n.label,
-                type: n.type,
-                threat_level: n.threat_level || 'NORMAL',
-                color: n.color || 'normal',
-                x: nodePosMap[n.label] ? nodePosMap[n.label].x : ((n.type === 'HOST' || n.type === 'GATEWAY' || n.type === 'EXTERNAL') ? hostX : serviceX),
-                y: nodePosMap[n.label] ? nodePosMap[n.label].y : canvas.height / 2,
-            }));
-
-            // Restrained Edge Routing: Prefer mostly straight lines; small ±12px offset only for multiple overlapping edges between same pair
-            const edgePairCounts = {};
-            const edgePairIndices = {};
-
-            data.graph_edges.forEach(e => {
-                const pairKey = `${e.source_label}->${e.target_label}`;
-                edgePairCounts[pairKey] = (edgePairCounts[pairKey] || 0) + 1;
-            });
-
-            edges = data.graph_edges.map(e => {
-                const pairKey = `${e.source_label}->${e.target_label}`;
-                const idx = edgePairIndices[pairKey] || 0;
-                edgePairIndices[pairKey] = idx + 1;
-                const total = edgePairCounts[pairKey];
-
-                const srcPos = nodePosMap[e.source_label] || { x: hostX, y: canvas.height / 2 };
-                const dstPos = nodePosMap[e.target_label] || { x: serviceX, y: canvas.height / 2 };
-
-                const midX = (srcPos.x + dstPos.x) / 2;
-                const midY = (srcPos.y + dstPos.y) / 2;
-
-                // Restrained curve offset: 0 for single edges (straight line!), ±14px max for duplicate parallel edges
-                let curveOffset = 0;
-                if (total > 1) {
-                    const rawOffset = (idx - (total - 1) / 2) * 14;
-                    curveOffset = Math.max(-18, Math.min(18, rawOffset));
-                }
-
-                return {
-                    x1: srcPos.x, y1: srcPos.y,
-                    x2: dstPos.x, y2: dstPos.y,
-                    controlX: midX,
-                    controlY: midY + curveOffset,
-                    risk: e.risk, color: e.color || 'normal', level: e.level || 'NORMAL'
-                };
-            });
-
-            particles = edges.map(e => ({
-                x1: e.x1, y1: e.y1, x2: e.x2, y2: e.y2,
-                controlX: e.controlX, controlY: e.controlY,
-                risk: e.risk, color: e.color,
-                progress: Math.random(), speed: 0.004 + e.risk * 0.012
-            }));
         }
 
         document.getElementById('btn-normal').addEventListener('click', async () => {
@@ -1774,8 +1450,7 @@ document.addEventListener('click', (e) => {
                 const data = await res.json();
                 if (res.ok && data.status === 'SUCCESS') {
                     if (data.csrf_token) csrfToken = data.csrf_token;
-                    localStorage.setItem('cybergraph_admin_token', token);
-                    adminToken = token;
+                    if (input) input.value = '';
 
                     if (statusDiv) {
                         statusDiv.style.display = 'block';
@@ -1786,7 +1461,7 @@ document.addEventListener('click', (e) => {
                     setTimeout(() => {
                         closeAdminAuthModal();
                         updateDeviceAccessSection();
-                        fetchBlockHistory();
+                        refreshBlockHistory();
                     }, 800);
                 } else {
                     if (statusDiv) {
@@ -1810,8 +1485,8 @@ document.addEventListener('click', (e) => {
             try {
                 await fetch('/api/auth/logout', { method: 'POST' });
             } catch(e) {}
-            localStorage.removeItem('cybergraph_admin_token');
-            adminToken = '';
+            csrfToken = '';
+            fetchCsrfToken();
             closeAdminAuthModal();
             updateDeviceAccessSection();
             alert('Logged out from Administrator session.');
