@@ -40,10 +40,12 @@ class GNNEngine:
         with open(art_path) as f:
             art = json.load(f)
 
+        from modules.trusted_model_loader import safe_load_torch, safe_load_joblib
         self.model = GATModel(input_dim=art["input_dim"], hidden_dim=art["hidden_dim"], output_dim=2)
-        self.model.load_state_dict(torch.load(model_path, map_location="cpu"))
+        state_dict = safe_load_torch(model_path, map_location="cpu", weights_only=True)
+        self.model.load_state_dict(state_dict)
         self.model.eval()
-        self.scaler = joblib.load(scaler_path)
+        self.scaler = safe_load_joblib(scaler_path)
         self.loaded = True
         logger.info("GAT engine loaded.")
 

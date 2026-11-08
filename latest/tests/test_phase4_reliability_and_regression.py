@@ -36,17 +36,20 @@ def test_client_script_contains_non_overlapping_polling_and_device_gate():
     res = client.get("/")
     assert res.status_code == 200
     html = res.get_data(as_text=True)
+    js_res = client.get("/static/js/app.js")
+    assert js_res.status_code == 200
+    client_code = html + "\n" + js_res.get_data(as_text=True)
 
     # 1. Verify isPolling guard is implemented
-    assert "isPolling" in html
+    assert "isPolling" in client_code
 
     # 2. Verify recursive scheduleNextPoll / setTimeout replaces blind setInterval
-    assert "scheduleNextPoll" in html
-    assert "setInterval(fetchStreamStep, 750)" not in html
+    assert "scheduleNextPoll" in client_code
+    assert "setInterval(fetchStreamStep, 750)" not in client_code
 
     # 3. Verify device access section is gated by state_version
-    assert "lastDeviceStateVersion" in html
-    assert "data.state_version !== lastDeviceStateVersion" in html
+    assert "lastDeviceStateVersion" in client_code
+    assert "data.state_version !== lastDeviceStateVersion" in client_code
 
 
 def test_html_and_client_contain_xss_protection_helpers():
@@ -55,13 +58,16 @@ def test_html_and_client_contain_xss_protection_helpers():
     res = client.get("/")
     assert res.status_code == 200
     html = res.get_data(as_text=True)
+    js_res = client.get("/static/js/app.js")
+    assert js_res.status_code == 200
+    client_code = html + "\n" + js_res.get_data(as_text=True)
 
     # Verify escapeHtml function is defined
-    assert "function escapeHtml(str)" in html
-    assert "function sanitizeIp(str)" in html
-    assert "escapeHtml(ev.level" in html
-    assert "escapeHtml(ev.source_host" in html
-    assert "escapeHtml(ev.summary" in html
+    assert "function escapeHtml(str)" in client_code
+    assert "function sanitizeIp(str)" in client_code
+    assert "escapeHtml(ev.level" in client_code
+    assert "escapeHtml(ev.source_host" in client_code
+    assert "escapeHtml(ev.summary" in client_code
 
 
 def test_api_error_handling_malformed_inputs():

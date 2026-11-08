@@ -29,6 +29,7 @@ import pandas as pd
 import joblib
 import torch
 import xgboost as xgb
+from modules.trusted_model_loader import safe_load_joblib, safe_load_torch
 
 from sklearn.metrics import (
     accuracy_score, precision_score, recall_score, f1_score,
@@ -134,9 +135,9 @@ def run_evaluation():
     # Load baseline ML artifacts
     xgb_model = xgb.XGBClassifier()
     xgb_model.load_model(XGB_PATH)
-    scaler = joblib.load(SCALER_PATH)
-    ae_model = joblib.load(AE_PATH)
-    fusion_model = joblib.load(FUSION_PATH)
+    scaler = safe_load_joblib(SCALER_PATH)
+    ae_model = safe_load_joblib(AE_PATH)
+    fusion_model = safe_load_joblib(FUSION_PATH)
 
     with open(ARTIFACTS_PATH) as f:
         art = json.load(f)
@@ -173,7 +174,7 @@ def run_evaluation():
 
     # --- MODEL C & D: GNN and GNN + BARI ---
     storage = TemporalGraphStorage.load(TEMPORAL_DATASET_PATH)
-    scalers = joblib.load(SCALERS_PATH)
+    scalers = safe_load_joblib(SCALERS_PATH)
     host_scaler = scalers["host_scaler"]
     service_scaler = scalers["service_scaler"]
     edge_scaler = scalers["edge_scaler"]
@@ -185,7 +186,7 @@ def run_evaluation():
         edge_dim=sample_snap.edge_attr.shape[1],
         hidden_dim=32,
     )
-    gnn_model.load_state_dict(torch.load(GNN_MODEL_PATH))
+    gnn_model.load_state_dict(safe_load_torch(GNN_MODEL_PATH, weights_only=True))
     gnn_model.eval()
 
     test_split_idx = int(round(len(storage.snapshots) * 0.75))

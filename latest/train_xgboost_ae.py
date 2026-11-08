@@ -291,6 +291,12 @@ def train_pipeline():
     with open(ARTIFACTS_PATH, "w") as f:
         json.dump(artifacts, f, indent=2)
 
+    try:
+        from modules.trusted_model_loader import regenerate_model_manifest
+        regenerate_model_manifest(MODELS_DIR)
+    except Exception as e:
+        print(f"[WARN] Unable to regenerate manifest: {e}")
+
     print(f"Phase 1 artifacts saved successfully to '{MODELS_DIR}'!")
     return artifacts
 

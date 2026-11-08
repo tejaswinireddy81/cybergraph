@@ -12,6 +12,7 @@ import json
 import numpy as np
 import pandas as pd
 import joblib
+from modules.trusted_model_loader import safe_load_joblib
 
 from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, roc_auc_score, confusion_matrix
 
@@ -28,18 +29,18 @@ DATASET_PATH = os.path.join(HERE, "NF-UNSW-NB15-v3.csv")
 
 
 def load_artifacts_and_data():
-    rf = joblib.load(RF_PATH)
-    scaler = joblib.load(SCALER_PATH)
+    rf = safe_load_joblib(RF_PATH)
+    scaler = safe_load_joblib(SCALER_PATH)
     
     ae_pkl = os.path.join(MODELS_DIR, "ae_model.pkl")
     if os.path.exists(ae_pkl):
-        ae = joblib.load(ae_pkl)
+        ae = safe_load_joblib(ae_pkl)
     elif os.path.exists(AE_PATH):
         try:
             import tensorflow as tf
             ae = tf.keras.models.load_model(AE_PATH)
         except Exception:
-            ae = joblib.load(AE_PATH)
+            ae = safe_load_joblib(AE_PATH)
     else:
         raise FileNotFoundError("AE model artifact not found.")
 

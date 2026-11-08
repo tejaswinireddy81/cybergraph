@@ -18,6 +18,7 @@ import numpy as np
 import pandas as pd
 import joblib
 import torch
+from modules.trusted_model_loader import safe_load_joblib, safe_load_torch
 import torch.nn.functional as F
 from sklearn.linear_model import LogisticRegression
 from sklearn.model_selection import train_test_split
@@ -64,8 +65,8 @@ def main():
     print("Loading dataset & trained artifacts …")
     df = pd.read_csv(DATASET_PATH)
 
-    rf = joblib.load(os.path.join(MODELS_DIR, "rf_model.pkl"))
-    scaler = joblib.load(os.path.join(MODELS_DIR, "scaler.pkl"))
+    rf = safe_load_joblib(os.path.join(MODELS_DIR, "rf_model.pkl"))
+    scaler = safe_load_joblib(os.path.join(MODELS_DIR, "scaler.pkl"))
     with open(os.path.join(MODELS_DIR, "artifacts.json")) as f:
         art = json.load(f)
     ae_threshold = art["ae_threshold"]
@@ -77,9 +78,9 @@ def main():
     with open(os.path.join(MODELS_DIR, "gat_artifacts.json")) as f:
         gat_art = json.load(f)
     gat = GATModel(input_dim=gat_art["input_dim"], hidden_dim=gat_art["hidden_dim"], output_dim=2)
-    gat.load_state_dict(torch.load(os.path.join(MODELS_DIR, "gat_model.pt"), map_location="cpu"))
+    gat.load_state_dict(safe_load_torch(os.path.join(MODELS_DIR, "gat_model.pt"), map_location="cpu", weights_only=True))
     gat.eval()
-    graph_scaler = joblib.load(os.path.join(MODELS_DIR, "graph_feature_scaler.pkl"))
+    graph_scaler = safe_load_joblib(os.path.join(MODELS_DIR, "graph_feature_scaler.pkl"))
 
     # --- rebuild the same host graph used at GAT training time, and score every host ---
     print("Scoring host graph with trained GAT …")
@@ -141,6 +142,11 @@ def main():
     print(f"Intercept: {fusion.intercept_[0]:.4f}")
 
     joblib.dump(fusion, os.path.join(MODELS_DIR, "fusion_model.pkl"))
+    try:
+        from modules.trusted_model_loader import regenerate_model_manifest
+        regenerate_model_manifest(MODELS_DIR)
+    except Exception as e:
+        print(f"[WARN] Unable to regenerate manifest: {e}")
     with open(os.path.join(OUT_DIR, "fusion_report.txt"), "w") as f:
         f.write("=== Learned Fusion Layer (replaces fixed hand-picked weights) ===\n\n")
         f.write(f"Features: [rf_prob, ae_normalized_error, gat_host_prob]\n")

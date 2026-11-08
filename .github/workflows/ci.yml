@@ -17,25 +17,50 @@ jobs:
     - name: Check out repository
       uses: actions/checkout@v4
 
-    - name: Set up Python 3.10
+    - name: Set up Python 3.12
       uses: actions/setup-python@v5
       with:
-        python-version: "3.10"
+        python-version: "3.12"
 
     - name: Install dependencies
       run: |
         python -m pip install --upgrade pip
         pip install -r requirements.txt
-        pip install bandit flake8
+        pip install bandit flake8 pip-audit
+
+    - name: Dependency Vulnerability Audit (pip-audit)
+      # Pinned legacy ML framework packages (PyTorch 2.1.2) have known deserialization CVEs
+      # mitigated at runtime via fail-closed SHA-256 trusted_model_loader and weights_only=True.
+      run: |
+        pip-audit --desc \
+          --ignore-vuln GHSA-3749-ghw9-m3mg \
+          --ignore-vuln GHSA-53q9-r3pm-6pq6 \
+          --ignore-vuln GHSA-5pcm-hx3q-hm94 \
+          --ignore-vuln GHSA-63cw-57p8-fm3p \
+          --ignore-vuln GHSA-887c-mr87-cxwp \
+          --ignore-vuln GHSA-c678-jfcj-6jmf \
+          --ignore-vuln GHSA-f4hp-rmr7-r7v8 \
+          --ignore-vuln GHSA-pg7h-5qx3-wjr3 \
+          --ignore-vuln GHSA-qfhq-4f3w-5fph \
+          --ignore-vuln GHSA-rrmf-rvhw-rf47 \
+          --ignore-vuln GHSA-vgrw-7cvw-pwgx \
+          --ignore-vuln GHSA-x3gm-94wq-g975 \
+          --ignore-vuln GHSA-cq46-m9x9-j8w2 \
+          --ignore-vuln GHSA-jw8x-6495-233v \
+          --ignore-vuln GHSA-68rp-wp8r-4726 \
+          --ignore-vuln GHSA-6w46-j5rx-g56g \
+          --ignore-vuln GHSA-3f84-rpwh-47g6 \
+          --ignore-vuln GHSA-9298-4cf8-g4wj
 
     - name: Static Security Analysis (Bandit)
       run: |
-        bandit -r modules response -ll -ii
+        bandit -r routes modules response config -ll -ii
 
     - name: Code Quality & Lint (Flake8)
       run: |
-        flake8 modules response --count --max-line-length=127 --statistics || true
+        flake8 routes modules response config --count --max-line-length=127 --extend-ignore=E203,W503 --statistics
 
     - name: Run Pytest suite
       run: |
         pytest tests/ -v
+

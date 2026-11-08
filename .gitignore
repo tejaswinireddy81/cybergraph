@@ -16,6 +16,8 @@ __pycache__/
 .env
 .env.*
 !.env.example
+.secrets.json
+**/.secrets.json
 
 venv/
 .venv/

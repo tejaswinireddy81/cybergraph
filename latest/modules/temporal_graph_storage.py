@@ -118,7 +118,8 @@ class TemporalGraphStorage:
     def load(cls, filepath):
         if not os.path.exists(filepath):
             raise FileNotFoundError(f"Temporal graph dataset file not found: {filepath}")
-        payload = torch.load(filepath)
+        from modules.trusted_model_loader import safe_load_torch
+        payload = safe_load_torch(filepath, weights_only=False)
         storage = cls()
         for s_dict in payload["snapshots"]:
             snap = TemporalGraphSnapshot(

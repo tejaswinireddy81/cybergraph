@@ -118,19 +118,21 @@ class InferenceEngine:
         import joblib
         import tensorflow as tf
 
+        from modules.trusted_model_loader import safe_load_joblib
+
         for path in (_RF_PATH, _AE_PATH, _SCALER_PATH, _ART_PATH):
             if not os.path.exists(path):
                 raise FileNotFoundError(
                     f"Artifact not found: {path}\nRun  python train_models.py  first.")
 
         logger.info("Loading RF …")
-        self._rf = joblib.load(_RF_PATH)
+        self._rf = safe_load_joblib(_RF_PATH)
 
         logger.info("Loading AE …")
         self._ae = tf.keras.models.load_model(_AE_PATH)
 
         logger.info("Loading Scaler …")
-        self._scaler = joblib.load(_SCALER_PATH)
+        self._scaler = safe_load_joblib(_SCALER_PATH)
 
         logger.info("Loading SHAP explainer against the RF model …")
         self.explainability.load(self._rf)

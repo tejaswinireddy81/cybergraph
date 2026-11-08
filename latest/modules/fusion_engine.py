@@ -48,7 +48,8 @@ class FusionEngine:
         self.model = None
         self.using_fallback = True
         if os.path.exists(_MODEL_PATH):
-            self.model = joblib.load(_MODEL_PATH)
+            from modules.trusted_model_loader import safe_load_joblib
+            self.model = safe_load_joblib(_MODEL_PATH)
             self.using_fallback = False
 
     def calculate_score(self, rf, ae, gat):

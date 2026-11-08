@@ -18,6 +18,7 @@ import json
 import numpy as np
 import joblib
 import torch
+from modules.trusted_model_loader import safe_load_joblib, safe_load_torch
 
 from modules.temporal_graph_storage import TemporalGraphStorage
 from modules.dynamic_temporal_gnn import DynamicBipartiteTemporalGNN
@@ -49,7 +50,7 @@ def evaluate_phase6():
         raise FileNotFoundError("Prerequisite Phase 5 model artifacts missing. Run train_temporal_gnn.py first.")
 
     storage = TemporalGraphStorage.load(TEMPORAL_DATASET_PATH)
-    scalers = joblib.load(SCALERS_PATH)
+    scalers = safe_load_joblib(SCALERS_PATH)
     host_scaler = scalers["host_scaler"]
     service_scaler = scalers["service_scaler"]
     edge_scaler = scalers["edge_scaler"]
@@ -61,7 +62,7 @@ def evaluate_phase6():
         edge_dim=sample_snap.edge_attr.shape[1],
         hidden_dim=32,
     )
-    gnn_model.load_state_dict(torch.load(GNN_MODEL_PATH))
+    gnn_model.load_state_dict(safe_load_torch(GNN_MODEL_PATH, weights_only=True))
     gnn_model.eval()
 
     train_split_idx = int(round(len(storage.snapshots) * 0.75))

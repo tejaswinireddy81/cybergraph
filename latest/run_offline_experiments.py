@@ -26,6 +26,7 @@ import sys
 import numpy as np
 import pandas as pd
 import joblib
+from modules.trusted_model_loader import safe_load_joblib, safe_load_torch
 
 from sklearn.preprocessing import StandardScaler
 from sklearn.linear_model import LogisticRegression
@@ -108,9 +109,9 @@ def run_experiments():
 
     xgb_model = xgb.XGBClassifier()
     xgb_model.load_model(XGB_PATH)
-    scaler = joblib.load(SCALER_PATH)
-    ae_model = joblib.load(AE_PATH)
-    fusion_model = joblib.load(FUSION_PATH)
+    scaler = safe_load_joblib(SCALER_PATH)
+    ae_model = safe_load_joblib(AE_PATH)
+    fusion_model = safe_load_joblib(FUSION_PATH)
 
     with open(ARTIFACTS_PATH) as f:
         art = json.load(f)
@@ -263,7 +264,7 @@ def run_experiments():
     log("\n--- Running Experiment 5: Dynamic Bipartite Temporal GNN (Phase 5) ---")
     if os.path.exists(GNN_MODEL_PATH) and os.path.exists(TEMPORAL_DATASET_PATH) and os.path.exists(SCALERS_PATH):
         storage = TemporalGraphStorage.load(TEMPORAL_DATASET_PATH)
-        scalers = joblib.load(SCALERS_PATH)
+        scalers = safe_load_joblib(SCALERS_PATH)
         host_scaler = scalers["host_scaler"]
         service_scaler = scalers["service_scaler"]
         edge_scaler = scalers["edge_scaler"]
@@ -275,7 +276,7 @@ def run_experiments():
             edge_dim=sample_snap.edge_attr.shape[1],
             hidden_dim=32,
         )
-        model.load_state_dict(torch.load(GNN_MODEL_PATH))
+        model.load_state_dict(safe_load_torch(GNN_MODEL_PATH, weights_only=True))
         model.eval()
 
         train_split_idx = int(round(len(storage.snapshots) * 0.75))

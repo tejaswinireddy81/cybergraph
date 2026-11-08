@@ -16,7 +16,20 @@ import threading
 import uuid
 from typing import Dict, Optional, List, Tuple
 import numpy as np
-from flask import Flask, render_template_string, jsonify, request, Response, g
+from flask import Flask, render_template, render_template_string, jsonify, request, Response, g, make_response
+from config.secrets_manager import get_hmac_secret, get_admin_token, get_session_secret
+from modules.auth_manager import (
+    create_admin_session,
+    terminate_session,
+    validate_session,
+    verify_admin_request,
+    verify_csrf_protection,
+    verify_read_viewer_access,
+    generate_signed_device_token as am_generate_signed_device_token,
+    verify_signed_device_token as am_verify_signed_device_token,
+    generate_csrf_token_for_session,
+)
+from modules.trusted_model_loader import safe_load_joblib, safe_load_torch
 from config.risk_thresholds import (
     RISK_L1_MAX,
     RISK_L2_MAX,
@@ -82,38 +95,15 @@ import secrets
 import hmac
 import hashlib
 
-ADMIN_TOKEN = os.environ.get("CYBERGRAPH_ADMIN_TOKEN")
-if not ADMIN_TOKEN:
-    ADMIN_TOKEN = secrets.token_hex(24)
-
-HMAC_SECRET = os.environ.get("CYBERGRAPH_HMAC_SECRET")
-if not HMAC_SECRET:
-    HMAC_SECRET = secrets.token_hex(32)
-
-def get_admin_token() -> str:
-    """Return the active server admin authorization token."""
-    global ADMIN_TOKEN
-    return ADMIN_TOKEN
+# Cryptographic Persistent Secrets & Admin Token
+ADMIN_TOKEN = get_admin_token()
+HMAC_SECRET = get_hmac_secret()
 
 def generate_signed_device_token(client_ip: str) -> str:
-    """Generate an HMAC-SHA256 authenticated device token bound to the client's IP."""
-    dev_uuid = str(uuid.uuid4())
-    ts = str(int(time.time()))
-    payload = f"{client_ip}:{dev_uuid}:{ts}"
-    sig = hmac.new(HMAC_SECRET.encode(), payload.encode(), hashlib.sha256).hexdigest()[:16]
-    return f"{dev_uuid}.{ts}.{sig}"
+    return am_generate_signed_device_token(client_ip)
 
 def verify_signed_device_token(token: str, client_ip: str) -> bool:
-    """Cryptographically verify that the device token was signed by this server for this IP."""
-    if not token or not isinstance(token, str) or "." not in token:
-        return False
-    parts = token.split(".")
-    if len(parts) != 3:
-        return False
-    dev_uuid, ts, sig = parts
-    payload = f"{client_ip}:{dev_uuid}:{ts}"
-    expected_sig = hmac.new(HMAC_SECRET.encode(), payload.encode(), hashlib.sha256).hexdigest()[:16]
-    return hmac.compare_digest(sig, expected_sig)
+    return am_verify_signed_device_token(token, client_ip)
 
 def sanitize_target_ip(raw: str) -> Optional[str]:
     """Robustly sanitize and parse an IPv4/IPv6 target address from input."""
@@ -246,11 +236,11 @@ def init_engines():
             df_stream_pool = df_full.iloc[int(len(df_full) * 0.75):].reset_index(drop=True)
 
         if os.path.exists(GNN_MODEL_PATH) and os.path.exists(SCALERS_PATH):
-            scalers = joblib.load(SCALERS_PATH)
+            scalers = safe_load_joblib(SCALERS_PATH)
             gnn_model = DynamicBipartiteTemporalGNN(
                 host_dim=8, service_dim=8, edge_dim=9, hidden_dim=32
             )
-            gnn_model.load_state_dict(torch.load(GNN_MODEL_PATH, weights_only=True))
+            gnn_model.load_state_dict(safe_load_torch(GNN_MODEL_PATH, weights_only=True))
             gnn_stream = OnlineGraphStream(gnn_model, scalers)
 
         try:
@@ -289,11 +279,13 @@ HTML_TEMPLATE = _load_html_template()
 
 @app.route("/api/stream_events")
 def stream_events():
-    """Server-Sent Events (SSE) stream providing real-time push updates.
+    """Server-Sent Events (SSE) stream providing real-time push updates (Viewer Access Protected).
     Yields full state snapshot events whenever state_version increments,
     with periodic heartbeats to maintain persistent connection.
     """
     init_engines()
+    if not verify_read_viewer_access(lambda tok: tok in _authorized_monitored_devices):
+        return Response("event: error\ndata: {\"error\": \"Unauthorized viewer\"}\n\n", mimetype="text/event-stream", status=401)
 
     def event_stream():
         last_version = -1
@@ -2003,522 +1995,31 @@ def _pipeline_worker():
 def index():
     init_engines()
     is_admin = is_admin_request()
-    client_ip = request.remote_addr or "127.0.0.1"
-    token_to_render = ADMIN_TOKEN if client_ip in ("127.0.0.1", "::1", "localhost") else ""
-    return render_template_string(HTML_TEMPLATE, admin_token=token_to_render, is_admin=is_admin)
+    # Zero credential exposure: Never embed ADMIN_TOKEN in HTML/JS responses
+    return render_template("index.html", is_admin=is_admin)
 
 
-@app.route("/api/set_mode", methods=["POST"])
-def set_mode():
-    init_engines()
-    if not is_admin_request():
-        logger.warning(f"[SECURITY 403] Unauthorized set_mode attempt from client IP: {request.remote_addr}")
-        return jsonify({
-            "status": "ERROR",
-            "message": "Forbidden: Administrative access required to change operating mode"
-        }), 403
+# --- Dedicated Authentication & CSRF Endpoints ---
 
-    m = request.args.get("mode")
-    if not m and request.is_json:
-        data = request.get_json(silent=True) or {}
-        m = data.get("mode")
-    if not m or m not in ("normal", "attack", "offline"):
-        m = "normal"
-    with state_lock:
-        shared_state["mode"] = m
-        shared_state["state_version"] += 1
-        v = shared_state["state_version"]
-    logger.info(f"[GLOBAL MODE CHANGE] Server mode set to '{m}' (state_version={v})")
-    try:
-        _run_pipeline_cycle()
-    except Exception as exc:
-        logger.warning(f"Immediate cycle execution warning on mode change: {exc}")
-    return jsonify({"status": "SUCCESS", "mode": m, "state_version": v})
+# --- Register Modular Flask Blueprints ---
+from routes.auth_routes import auth_bp
+from routes.admin_routes import admin_bp
+from routes.device_routes import device_bp
+from routes.stream_routes import stream_bp
+from routes.report_routes import report_bp
 
+app.register_blueprint(auth_bp)
+app.register_blueprint(admin_bp)
+app.register_blueprint(device_bp)
+app.register_blueprint(stream_bp)
+app.register_blueprint(report_bp)
 
-@app.route("/api/stream_step")
-def stream_step():
-    """Returns a read-only snapshot of the shared server state."""
-    init_engines()
-    with state_lock:
-        snapshot = copy.deepcopy(shared_state)
-    return jsonify(snapshot)
-
-
-@app.route("/api/pipeline_diag")
-def pipeline_diag():
-    """Returns the last 5 processed live flows with full diagnostic breakdown.
-    Used to numerically validate that the ML pipeline is scoring correctly.
-    """
-    init_engines()
-    from modules.live_traffic_engine import _diag_flows
-    return jsonify({
-        "description": "Last 5 live flows processed through the ML pipeline",
-        "note": "ae_raw_mse should be < ae_mse_max=53.2 for normal traffic; xgb should be < 0.35 for normal",
-        "ae_mse_max": 53.19590666580561,
-        "ae_threshold": 0.08100921690464065,
-        "flows": list(_diag_flows),
-        "flow_count": len(_diag_flows),
-    })
-
-
-@app.route("/api/graph_intelligence")
-def graph_intelligence():
-    """Returns correlation engine data + Kill Chain stage analysis."""
-    init_engines()
-    top_correlated = correlation_engine.get_top_correlated(top_n=10)
-    return jsonify({
-        "correlated_ips": top_correlated,
-        "kill_chain_stages": list(correlation_engine._timelines.keys()) if hasattr(correlation_engine, '_timelines') else [],
-        "escalation_count": sum(1 for ip in correlation_engine._timelines if correlation_engine._build_report(ip).get("escalation_detected", False))
-    })
-
-
-@app.route("/api/pipeline_explain")
-def pipeline_explain():
-    """Returns the last flow's pipeline step breakdown and SHAP explanation."""
-    init_engines()
-    state = dict(_last_pipeline_state)
-    explain_state = dict(_last_explain_state)
-
-    xai_report = None
-    if explain_state and "raw_feat_1d" in explain_state:
-        try:
-            xai_report = xai_engine.explain_flow_edge(
-                edge_attr=explain_state["edge_attr"],
-                risk_score=explain_state["risk_score"],
-                source_host=explain_state["source_host"],
-                target_service=explain_state["target_service"],
-                raw_feat_1d=explain_state["raw_feat_1d"],
-                xgb_model=explain_state["xgb_model"],
-                feature_cols=None,
-            )
-        except Exception:
-            pass
-
-    mitre_explanations = []
-    if state.get("mitre_mappings_count", 0) > 0:
-        mitre_explanations.append(f"{state['mitre_mappings_count']} MITRE ATT&CK technique(s) mapped from behavioral evidence")
-
-    return jsonify({
-        "pipeline_state": state,
-        "xai_explanation": xai_report,
-        "mitre_explanations": mitre_explanations,
-        "bari_context": {
-            "route_string": "N/A (per-flow data)",
-            "status": "BARI contextual enrichment active",
-        }
-    })
-
-
-@app.route("/api/attack_journey/<src_ip>")
-def attack_journey(src_ip):
-    """Returns the multi-hop attack journey for a specific source IP."""
-    init_engines()
-    timeline = correlation_engine.get_timeline(src_ip)
-    journey = attack_journey_engine._journeys.get(src_ip)
-    top_priority = attack_journey_engine.get_top_threat_priorities(limit=1)
-
-    if journey and journey["timeline"]:
-        return jsonify({
-            "source_ip": src_ip,
-            "journey_path": journey["journey_path"],
-            "route_string": journey["route_string"],
-            "timeline": journey["timeline"][-10:],
-            "attack_objective": journey.get("timeline", [{}])[-1].get("stage", "Unknown"),
-            "threat_priority_score": top_priority[0]["threat_priority_score"] if top_priority else 0,
-            "threat_priority_tier": top_priority[0]["threat_priority_tier"] if top_priority else "LOW",
-            "detection_lead_time_sec": journey.get("detection_lead_time_sec", 0),
-            "early_detection_time": journey.get("early_t"),
-            "critical_detection_time": journey.get("critical_t"),
-        })
-    else:
-        return jsonify({
-            "source_ip": src_ip,
-            "message": "No attack journey data found for this IP.",
-            "timeline": timeline,
-        })
-
-
-@app.route("/api/threat_priorities")
-def threat_priorities():
-    """Returns ranked threat priority queue from Attack Journey Engine."""
-    init_engines()
-    priorities = attack_journey_engine.get_top_threat_priorities(limit=10)
-    for p in priorities:
-        src_ip = p["source_ip"]
-        correlation_report = correlation_engine._build_report(src_ip)
-        mitre_mappings = mitre_mapper.map_flow_to_techniques(
-            flow_record={"src_ip": src_ip},
-            bari_result={},
-            correlation_result=correlation_report,
-            attack_journey={"journey_path": [], "attack_objective": {}}
-        )
-        p["mitre_techniques"] = [
-            {
-                "technique_id": m["technique_id"],
-                "technique_name": m["technique_name"],
-                "confidence": m["confidence"]
-            }
-            for m in mitre_mappings
-        ]
-    return jsonify({
-        "priorities": priorities,
-        "mitre_supported": ["T1046", "T1110", "T1498"],
-        "total_active_threats": len(priorities),
-    })
-
-
-@app.route("/api/simulate_attack_path")
-def simulate_attack_path():
-    """Defensive 'What-If' Attack Path Simulator."""
-    init_engines()
-    start_host = request.args.get("host", "10.0.0.21")
-    target_port = int(request.args.get("port", 3306))
-    strategy = request.args.get("strategy", "lateral_movement")
-    sim = attack_journey_engine.simulate_attack_path(
-        start_host=start_host, target_port=target_port,
-        strategy=strategy, bari_engine=bari_engine
-    )
-    return jsonify(sim)
-
-
-@app.route("/api/mitre_mappings")
-def mitre_mappings():
-    """Returns all supported MITRE ATT&CK technique mappings and metadata."""
-    init_engines()
-    supported = []
-    for tech_id in mitre_mapper.get_supported_techniques():
-        info = mitre_mapper.get_technique_info(tech_id)
-        supported.append({
-            "technique_id": info.technique_id,
-            "technique_name": info.technique_name,
-            "tactic": info.tactic,
-            "description": info.description,
-            "required_confidence_threshold": info.required_confidence_threshold,
-            "evidence_weights": info.evidence_weights,
-            "behavioral_indicators": info.behavioral_indicators,
-        })
-    return jsonify({
-        "supported_techniques": supported,
-        "unsupported_count": 17,
-        "mapping_method": "evidence-based deterministic rules",
-        "confidence_formula": "confidence = weighted evidence match × model confidence damping",
-        "separation_of_concerns": "MITRE provides ATT&CK contextualization; XGBoost/AE/GNN/BARI detect and score behavior",
-    })
-
-
-@app.route("/api/export_report")
-def export_report():
-    init_engines()
-    with state_lock:
-        st = copy.deepcopy(shared_state["stats"])
-        recent_events = copy.deepcopy(_recent_event_history)
-        active_evals = copy.deepcopy(shared_state.get("evals", []))
-        sim_blocked = list(fw_executor.simulated_acl_blocked_ips) if fw_executor else []
-        real_blocked = list(fw_executor.active_os_firewall_rules.keys()) if fw_executor else []
-        fw_history = list(fw_executor.action_history) if fw_executor and hasattr(fw_executor, "action_history") else []
-        is_real_enabled = fw_executor.enable_real_blocking if fw_executor else False
-
-    # Consolidate unique threat and audit events
-    threat_records = []
-    seen_ids = set()
-
-    all_raw_events = recent_events + active_evals
-    for ev in all_raw_events:
-        rec_id = (ev.get("source_host"), ev.get("target_service"), ev.get("timestamp"))
-        if rec_id not in seen_ids:
-            seen_ids.add(rec_id)
-            threat_records.append(ev)
-
-    # Sort descending by risk score and timestamp
-    threat_records.sort(key=lambda x: (x.get("risk_score", 0.0), x.get("timestamp", 0.0)), reverse=True)
-
-    # Format check for JSON export
-    if request.args.get("format") == "json":
-        return jsonify({
-            "status": "SUCCESS",
-            "generated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-            "telemetry_summary": st,
-            "firewall_status": {
-                "real_blocking_enabled": is_real_enabled,
-                "simulated_acl_blocked_ips": sim_blocked,
-                "real_os_firewall_blocked_ips": real_blocked,
-                "total_blocked_count": len(set(sim_blocked + real_blocked)),
-                "action_history": fw_history,
-            },
-            "detected_threats_count": len(threat_records),
-            "threat_events": threat_records,
-        })
-
-    # Build HTML Incident Rows
-    threat_rows_html = ""
-    if threat_records:
-        for idx, ev in enumerate(threat_records[:50], 1):
-            ts_val = ev.get("timestamp")
-            if ts_val:
-                try:
-                    ts_float = float(ts_val)
-                    if ts_float > 1e11:  # milliseconds
-                        ts_float /= 1000.0
-                    ts_str = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts_float))
-                except Exception:
-                    ts_str = str(ts_val)
-            else:
-                ts_str = time.strftime("%Y-%m-%d %H:%M:%S")
-
-            lvl = ev.get("level", "Level 1 — Normal")
-            badge_color = ev.get("badge_color", "#10b981")
-            risk_score = float(ev.get("risk_score", 0.0))
-            src = ev.get("source_host", "UNKNOWN")
-            dst = ev.get("target_service", "UNKNOWN")
-            summary = ev.get("summary", "Normal Traffic Flow")
-
-            # Evidence & Model Findings
-            xai = ev.get("xai_explanation", {})
-            reasons = xai.get("why_this_attack_reasons", []) if isinstance(xai, dict) else []
-            reasons_html = "".join([f"<li>{r}</li>" for r in reasons]) if reasons else "<li>Baseline traffic profile match</li>"
-
-            # MITRE mappings
-            mitre_list = ev.get("mitre_mappings", [])
-            mitre_html = ""
-            if mitre_list:
-                mitre_badges = []
-                for m in mitre_list:
-                    mitre_badges.append(f"<span style='background:#e0f2fe; color:#0369a1; padding:2px 6px; border-radius:4px; font-weight:700;'>{m.get('technique_id')} ({m.get('technique_name')}) [{(float(m.get('confidence',0))*100):.1f}%]</span>")
-                mitre_html = f"<div style='margin-top:4px;'><strong>MITRE ATT&CK:</strong> {' '.join(mitre_badges)}</div>"
-
-            # Recommended Action
-            rec_fw = ev.get("recommended_firewall_action", {})
-            target_ip = rec_fw.get("target_ip", src.replace("HOST:", "").replace("EXT:", "").replace("GW:", "").replace("PENDING:", ""))
-            cmd_preview = rec_fw.get("windows_netsh_rule_preview", f"netsh advfirewall firewall add rule name=\"Block-GNN-{target_ip}\" dir=in action=block remoteip={target_ip}")
-            rec_action = f"Block IP {target_ip} via OS Firewall Rule<br><code style='background:#f1f5f9; padding:2px 4px; font-size:11px;'>{cmd_preview}</code>" if risk_score >= 0.50 else "Monitor traffic; no blocking action required."
-
-            # Blocking Status
-            is_ip_blocked = (target_ip in sim_blocked) or (target_ip in real_blocked)
-            block_status_html = f"<span style='color:#ef4444; font-weight:700;'>BLOCKED</span>" if is_ip_blocked else "<span style='color:#10b981; font-weight:700;'>ALLOWED / MONITORING</span>"
-
-            threat_rows_html += f"""
-            <tr style="border-bottom: 1px solid #e2e8f0;">
-                <td style="padding: 10px; font-family: monospace; font-size: 11px;">{ts_str}</td>
-                <td style="padding: 10px;"><span style="background:{badge_color}; color:#fff; padding:3px 8px; border-radius:4px; font-weight:700; font-size:11px;">{lvl}</span><br><small>Risk: {risk_score:.4f}</small></td>
-                <td style="padding: 10px;"><strong>Src:</strong> {src}<br><strong>Dst:</strong> {dst}</td>
-                <td style="padding: 10px; font-size: 12px;">
-                    <div>{summary}</div>
-                    <ul style="margin:4px 0 0 16px; padding:0; font-size:11px; color:#475569;">{reasons_html}</ul>
-                    {mitre_html}
-                </td>
-                <td style="padding: 10px; font-size: 11px;">{rec_action}</td>
-                <td style="padding: 10px; font-size: 11px;">{block_status_html}</td>
-            </tr>
-            """
-    else:
-        threat_rows_html = "<tr><td colspan='6' style='text-align:center; padding:20px; color:#64748b;'>No security incidents recorded in current session.</td></tr>"
-
-    # Build Firewall Action History Rows
-    fw_rows_html = ""
-    if fw_history:
-        for act in reversed(fw_history[-30:]):
-            act_ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(act.get("timestamp", time.time())))
-            act_type = act.get("action", "UNKNOWN")
-            act_ip = act.get("ip", "-")
-            act_mode = act.get("execution_mode", "SIMULATED_MEMORY_ONLY")
-            act_status = act.get("status", "-")
-            fw_rows_html += f"""
-            <tr style="border-bottom: 1px solid #e2e8f0;">
-                <td style="padding: 8px; font-family: monospace; font-size: 11px;">{act_ts}</td>
-                <td style="padding: 8px; font-weight:700; color:{'#ef4444' if act_type == 'BLOCK' else '#10b981'};">{act_type}</td>
-                <td style="padding: 8px; font-family: monospace;">{act_ip}</td>
-                <td style="padding: 8px; font-size: 11px;">{act_mode}</td>
-                <td style="padding: 8px; font-size: 11px;">{act_status}</td>
-            </tr>
-            """
-    else:
-        fw_rows_html = "<tr><td colspan='5' style='text-align:center; padding:15px; color:#64748b;'>No firewall actions executed in current session.</td></tr>"
-
-    blocked_list_str = ", ".join(sorted(list(set(sim_blocked + real_blocked)))) if (sim_blocked or real_blocked) else "None"
-
-    report_html = f"""
-    <!DOCTYPE html>
-    <html>
-    <head>
-        <title>CYBERGRAPH COMMAND CENTER — Incident Security Audit Report</title>
-        <style>
-            body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; margin: 30px; color: #1e293b; line-height: 1.5; background: #f8fafc; }}
-            .container {{ max-width: 1200px; margin: 0 auto; background: #fff; padding: 30px; border-radius: 12px; box-shadow: 0 4px 6px -1px rgba(0,0,0,0.1); border: 1px solid #e2e8f0; }}
-            h1 {{ color: #0f172a; border-bottom: 3px solid #0284c7; padding-bottom: 12px; margin-top: 0; font-size: 26px; }}
-            h2 {{ color: #1e293b; font-size: 18px; margin-top: 24px; border-bottom: 1px solid #cbd5e1; padding-bottom: 6px; }}
-            .meta-bar {{ display: flex; justify-content: space-between; font-size: 13px; color: #64748b; margin-bottom: 20px; }}
-            .kpi-grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 14px; margin-bottom: 24px; }}
-            .kpi-box {{ background: #f1f5f9; border: 1px solid #e2e8f0; border-radius: 8px; padding: 14px; text-align: center; }}
-            .kpi-val {{ font-size: 24px; font-weight: 800; color: #0f172a; margin-top: 4px; }}
-            .kpi-lbl {{ font-size: 11px; text-transform: uppercase; letter-spacing: 0.05em; color: #64748b; font-weight: 600; }}
-            table {{ width: 100%; border-collapse: collapse; margin-top: 10px; font-size: 13px; }}
-            th {{ background: #f8fafc; padding: 10px; text-align: left; font-weight: 700; color: #475569; border-bottom: 2px solid #cbd5e1; }}
-            td {{ vertical-align: top; }}
-            .status-box {{ background: #eff6ff; border: 1px solid #bfdbfe; border-radius: 8px; padding: 14px; margin-bottom: 20px; font-size: 13px; }}
-        </style>
-    </head>
-    <body>
-        <div class="container">
-            <h1>CYBERGRAPH COMMAND CENTER — Incident Security Audit Report</h1>
-            <div class="meta-bar">
-                <span><strong>Generated:</strong> {time.strftime('%Y-%m-%d %H:%M:%S')}</span>
-                <span><strong>Active Source:</strong> {st['current_data_source']}</span>
-                <span><strong>Auditor Mode:</strong> Real-Time Automated Defense Inspection</span>
-            </div>
-
-            <div class="kpi-grid">
-                <div class="kpi-box">
-                    <div class="kpi-lbl">Total Evaluated Flows</div>
-                    <div class="kpi-val">{st['total_flows']}</div>
-                </div>
-                <div class="kpi-box">
-                    <div class="kpi-lbl">Level 1 (Normal)</div>
-                    <div class="kpi-val" style="color: #10b981;">{st['level1_normal']}</div>
-                </div>
-                <div class="kpi-box">
-                    <div class="kpi-lbl">Level 2 (Suspicious)</div>
-                    <div class="kpi-val" style="color: #f59e0b;">{st['level2_suspicious']}</div>
-                </div>
-                <div class="kpi-box">
-                    <div class="kpi-lbl">Level 3 (Critical)</div>
-                    <div class="kpi-val" style="color: #ef4444;">{st['level3_critical']}</div>
-                </div>
-                <div class="kpi-box">
-                    <div class="kpi-lbl">Peak Risk Observed</div>
-                    <div class="kpi-val" style="color: #6366f1;">{st.get('peak_risk', 0.0):.4f}</div>
-                </div>
-                <div class="kpi-box">
-                    <div class="kpi-lbl">Firewall Rules Applied</div>
-                    <div class="kpi-val" style="color: #0284c7;">{st['real_os_rules_applied']}</div>
-                </div>
-            </div>
-
-            <div class="status-box">
-                <h3 style="margin-top:0; color:#1e40af; font-size:15px;">Active Firewall & Containment Status</h3>
-                <div><strong>Enforcement Mode:</strong> {'REAL OS FIREWALL' if is_real_enabled else 'SIMULATED ACL / RECOMMENDED APPROVAL'}</div>
-                <div><strong>Currently Blocked IP Addresses:</strong> {blocked_list_str}</div>
-                <div><strong>Real Windows Firewall Rules Active:</strong> {len(real_blocked)} | <strong>Simulated In-Memory Blocks:</strong> {len(sim_blocked)}</div>
-            </div>
-
-            <h2>1. Detected Threat Events & Diagnostic Findings</h2>
-            <table>
-                <thead>
-                    <tr>
-                        <th style="width: 140px;">Timestamp</th>
-                        <th style="width: 120px;">Severity & Level</th>
-                        <th style="width: 180px;">Source & Destination</th>
-                        <th>Evidence & Model Findings</th>
-                        <th style="width: 220px;">Recommended Action</th>
-                        <th style="width: 120px;">Firewall Status</th>
-                    </tr>
-                </thead>
-                <tbody>
-                    {threat_rows_html}
-                </tbody>
-            </table>
-
-            <h2>2. Firewall Action & Response History</h2>
-            <table>
-                <thead>
-                    <tr>
-                        <th style="width: 140px;">Timestamp</th>
-                        <th style="width: 90px;">Action</th>
-                        <th style="width: 160px;">Target IP</th>
-                        <th>Execution Mode</th>
-                        <th>Status Result</th>
-                    </tr>
-                </thead>
-                <tbody>
-                    {fw_rows_html}
-                </tbody>
-            </table>
-
-            <h2>3. MITRE ATT&CK Contextual Framework Reference</h2>
-            <div style="background:#f8fafc; border:1px solid #e2e8f0; border-radius:8px; padding:14px; font-size:13px;">
-                <p><strong>Separation of Concerns:</strong> XGBoost, Autoencoder, Fusion Layer, and Dynamic Temporal GNN compute intrinsic anomaly and graph edge risks. The MITRE ATT&CK engine deterministically maps corroborated evidence to adversary tactics and techniques:</p>
-                <ul style="margin:6px 0 0 20px;">
-                    <li><strong>T1046 — Network Service Discovery (Discovery):</strong> Identified via BARI route intelligence and multi-port probing patterns.</li>
-                    <li><strong>T1110 — Brute Force (Credential Access):</strong> High-frequency connection attempts to authentication services (SSH, RDP, SMB).</li>
-                    <li><strong>T1498 — Network Denial of Service (Impact):</strong> Volumetric throughput and rapid packet rate anomalies.</li>
-                </ul>
-            </div>
-        </div>
-    </body>
-    </html>
-    """
-    return Response(report_html, mimetype="text/html")
-
-
-@app.route("/api/execute_real_block", methods=["POST"])
-def execute_real_block():
-    init_engines()
-    if not is_admin_request():
-        logger.warning(f"[SECURITY 403] Unauthorized execute_real_block attempt from client IP: {request.remote_addr}")
-        return jsonify({
-            "status": "ERROR",
-            "message": "Forbidden: Administrative access required"
-        }), 403
-
-    target_ip = request.args.get("ip") or request.args.get("target_ip")
-    if not target_ip and request.is_json:
-        data = request.get_json(silent=True) or {}
-        target_ip = data.get("ip") or data.get("target_ip")
-
-    if not target_ip:
-        return jsonify({"status": "ERROR", "message": "Missing IP parameter."}), 400
-
-    clean_ip = sanitize_target_ip(target_ip)
-    if not clean_ip:
-        return jsonify({"status": "ERROR", "message": f"Invalid IP address: '{target_ip}'"}), 400
-
-    res = fw_executor.execute_block(clean_ip, force_real=True)
-    if res.get("status") in ["REAL_FIREWALL_RULE_APPLIED", "REAL_FIREWALL_RULE_ELEVATED"] or res.get("execution_mode") in ["REAL_OS_FIREWALL", "REAL_OS_FIREWALL_ELEVATED"]:
-        with state_lock:
-            shared_state["stats"]["real_os_rules_applied"] += 1
-
-    return jsonify(res)
-
-
-@app.route("/api/unblock_ip", methods=["POST"])
-def api_unblock_ip():
-    init_engines()
-    if not is_admin_request():
-        logger.warning(f"[SECURITY 403] Unauthorized unblock_ip attempt from client IP: {request.remote_addr}")
-        return jsonify({
-            "status": "ERROR",
-            "message": "Forbidden: Administrative access required"
-        }), 403
-
-    target_ip = request.args.get("ip") or request.args.get("target_ip")
-    if not target_ip and request.is_json:
-        data = request.get_json(silent=True) or {}
-        target_ip = data.get("ip") or data.get("target_ip")
-
-    if not target_ip:
-        return jsonify({"status": "ERROR", "message": "Missing IP parameter."}), 400
-
-    clean_ip = sanitize_target_ip(target_ip)
-    if not clean_ip:
-        return jsonify({"status": "ERROR", "message": f"Invalid IP address: '{target_ip}'"}), 400
-
-    res = fw_executor.execute_unblock(clean_ip)
-    return jsonify(res)
-
-
-@app.route("/api/verify_blocked", methods=["GET"])
-def api_verify_blocked():
-    init_engines()
-    target_ip = request.args.get("ip") or request.args.get("target_ip")
-    if not target_ip:
-        return jsonify({"status": "ERROR", "message": "Missing IP parameter."}), 400
-
-    clean_ip = sanitize_target_ip(target_ip)
-    if not clean_ip:
-        return jsonify({"status": "ERROR", "message": f"Invalid IP address: '{target_ip}'"}), 400
-
-    return jsonify(fw_executor.verify_blocked(clean_ip))
+# Top-level backward-compatible function aliases for test modules
+from routes.admin_routes import execute_real_block, api_unblock_ip, api_verify_blocked, api_blocks_history
+from routes.device_routes import approve_device, reject_device, revoke_device
+from routes.stream_routes import stream_step, stream_events, set_mode
+from routes.report_routes import export_report, attack_journey
+from routes.auth_routes import api_auth_login, api_auth_logout, api_auth_status, api_auth_csrf
 
 
 @app.before_request
@@ -2562,8 +2063,8 @@ def set_security_headers_and_cookie(response):
 
     # Security Headers to prevent framing, MIME sniffing, and unauthorized script injection
     response.headers["Content-Security-Policy"] = (
-        "default-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net https://fonts.googleapis.com https://fonts.gstatic.com data:; "
-        "script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; "
+        "default-src 'self' https://cdn.jsdelivr.net https://fonts.googleapis.com https://fonts.gstatic.com data:; "
+        "script-src 'self' https://cdn.jsdelivr.net; "
         "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; "
         "font-src 'self' https://fonts.gstatic.com; "
         "img-src 'self' data:; "
@@ -2577,38 +2078,12 @@ def set_security_headers_and_cookie(response):
 
 def is_admin_request() -> bool:
     """Determine if current HTTP request originates from authenticated CyberGraph Admin.
-    Validates token via:
-      1. X-Admin-Token or X-CSRF-Token header
-      2. Authorization: Bearer <token> header
-      3. cybergraph_admin_token cookie
-      4. JSON body or query param 'admin_token'
-      5. Explicit test environment bypass via CYBERGRAPH_ALLOW_LOCALHOST_ADMIN=1.
+    Enforces strict security:
+      1. Validates authenticated session cookie ('cybergraph_session') or 'X-Admin-Token' / 'Bearer <token>' headers.
+      2. Strictly REJECTS credentials or tokens passed in URL query parameters.
+      3. Verifies CSRF protection for state-changing requests.
     """
-    token_candidate = (
-        request.headers.get("X-Admin-Token")
-        or request.headers.get("X-CSRF-Token")
-        or request.cookies.get("cybergraph_admin_token")
-    )
-    if not token_candidate and request.headers.get("Authorization", "").startswith("Bearer "):
-        token_candidate = request.headers.get("Authorization", "")[7:].strip()
-    if not token_candidate and request.is_json:
-        data = request.get_json(silent=True) or {}
-        token_candidate = data.get("admin_token") or data.get("token")
-    if not token_candidate:
-        token_candidate = request.args.get("admin_token") or request.args.get("token")
-
-    if token_candidate and hmac.compare_digest(str(token_candidate).strip(), ADMIN_TOKEN):
-        return True
-
-    # Test environment bypass flag
-    if os.environ.get("CYBERGRAPH_ALLOW_LOCALHOST_ADMIN") == "1":
-        client_ip = request.remote_addr or "127.0.0.1"
-        srv_ip = get_server_local_ip()
-        if client_ip in ("127.0.0.1", "::1", "localhost", "0.0.0.0") or (srv_ip and client_ip == srv_ip):
-            return True
-
-    return False
-
+    return verify_admin_request()
 
 @app.route("/api/device_requests", methods=["GET"])
 def api_device_requests():
@@ -2624,6 +2099,9 @@ def api_device_requests():
 @app.route("/api/approve_device", methods=["POST"])
 def api_approve_device():
     init_engines()
+    csrf_ok, csrf_err = verify_csrf_protection()
+    if not csrf_ok:
+        return jsonify({"status": "ERROR", "message": f"Forbidden: {csrf_err}"}), 403
     if not is_admin_request():
         logger.warning(f"[SECURITY 403] Unauthorized approve_device attempt from client IP: {request.remote_addr}")
         return jsonify({
@@ -2650,6 +2128,9 @@ def api_approve_device():
 @app.route("/api/reject_device", methods=["POST"])
 def api_reject_device():
     init_engines()
+    csrf_ok, csrf_err = verify_csrf_protection()
+    if not csrf_ok:
+        return jsonify({"status": "ERROR", "message": f"Forbidden: {csrf_err}"}), 403
     if not is_admin_request():
         logger.warning(f"[SECURITY 403] Unauthorized reject_device attempt from client IP: {request.remote_addr}")
         return jsonify({
@@ -2676,6 +2157,9 @@ def api_reject_device():
 @app.route("/api/revoke_device", methods=["POST"])
 def api_revoke_device():
     init_engines()
+    csrf_ok, csrf_err = verify_csrf_protection()
+    if not csrf_ok:
+        return jsonify({"status": "ERROR", "message": f"Forbidden: {csrf_err}"}), 403
     if not is_admin_request():
         logger.warning(f"[SECURITY 403] Unauthorized revoke_device attempt from client IP: {request.remote_addr}")
         return jsonify({

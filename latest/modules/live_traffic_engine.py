@@ -50,9 +50,10 @@ class LiveTrafficEngine:
         self.xgb_model = xgb.XGBClassifier()
         self.xgb_model.load_model(XGB_PATH)
 
-        self.scaler = joblib.load(SCALER_PATH)
-        self.ae_model = joblib.load(AE_PATH)
-        self.fusion_model = joblib.load(FUSION_PATH)
+        from modules.trusted_model_loader import safe_load_joblib
+        self.scaler = safe_load_joblib(SCALER_PATH)
+        self.ae_model = safe_load_joblib(AE_PATH)
+        self.fusion_model = safe_load_joblib(FUSION_PATH)
 
         # Cache scaler stats for fast z-score reporting in diagnostics
         self._scaler_mean  = self.scaler.mean_

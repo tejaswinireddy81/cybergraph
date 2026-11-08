@@ -78,6 +78,12 @@ def main():
     else:
         print("[OK] BARI baseline cache already exists in models/.")
 
+    # 5. Regenerate Model Manifest for fail-closed trusted loader
+    from modules.trusted_model_loader import regenerate_model_manifest
+    print("\n[SETUP] Regenerating models/model_manifest.json with SHA-256 signatures ...")
+    manifest = regenerate_model_manifest(MODELS_DIR)
+    print(f"[SUCCESS] Registered {len(manifest)} models in model_manifest.json.")
+
     print("\n" + "=" * 60)
     print("ALL CYBERGRAPH PIPELINE PREREQUISITES READY!")
     print("Start server with: python app.py")
@@ -86,3 +92,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

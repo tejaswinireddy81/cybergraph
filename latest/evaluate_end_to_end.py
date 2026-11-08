@@ -32,6 +32,7 @@ import pandas as pd
 import joblib
 import torch
 import torch.nn.functional as F
+from modules.trusted_model_loader import safe_load_joblib, safe_load_torch
 
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import (
@@ -162,7 +163,7 @@ def load_everything():
 
     print("Loading RF...")
 
-    rf = joblib.load(
+    rf = safe_load_joblib(
         os.path.join(
             MODELS_DIR,
             "rf_model.pkl"
@@ -171,7 +172,7 @@ def load_everything():
 
     print("Loading scaler...")
 
-    scaler = joblib.load(
+    scaler = safe_load_joblib(
         os.path.join(
             MODELS_DIR,
             "scaler.pkl"
@@ -189,7 +190,7 @@ def load_everything():
 
     if os.path.exists(ae_pkl):
 
-        ae = joblib.load(ae_pkl)
+        ae = safe_load_joblib(ae_pkl)
 
         print("AE loaded from ae_model.pkl")
 
@@ -233,7 +234,7 @@ def load_everything():
 
     print("Loading Fusion model...")
 
-    fusion = joblib.load(
+    fusion = safe_load_joblib(
         os.path.join(
             MODELS_DIR,
             "fusion_model.pkl"
@@ -263,18 +264,19 @@ def load_everything():
     )
 
     gat.load_state_dict(
-        torch.load(
+        safe_load_torch(
             os.path.join(
                 MODELS_DIR,
                 "gat_model.pt"
             ),
             map_location="cpu",
+            weights_only=True,
         )
     )
 
     gat.eval()
 
-    graph_scaler = joblib.load(
+    graph_scaler = safe_load_joblib(
         os.path.join(
             MODELS_DIR,
             "graph_feature_scaler.pkl"

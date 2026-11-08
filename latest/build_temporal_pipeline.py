@@ -19,6 +19,7 @@ import numpy as np
 import pandas as pd
 import joblib
 
+from modules.trusted_model_loader import safe_load_joblib, safe_load_torch
 from train_xgboost_ae import FEATURE_COLS, load_dataset, train_pipeline
 from modules.bipartite_graph_builder import BipartiteGraphBuilder
 from modules.temporal_graph_storage import TemporalGraphSnapshot, TemporalGraphStorage
@@ -43,9 +44,9 @@ def build_pipeline():
     xgb_model = xgb.XGBClassifier()
     xgb_model.load_model(XGB_PATH)
 
-    scaler = joblib.load(SCALER_PATH)
-    ae_model = joblib.load(AE_PATH)
-    fusion_model = joblib.load(FUSION_PATH)
+    scaler = safe_load_joblib(SCALER_PATH)
+    ae_model = safe_load_joblib(AE_PATH)
+    fusion_model = safe_load_joblib(FUSION_PATH)
 
     with open(ARTIFACTS_PATH) as f:
         art = json.load(f)

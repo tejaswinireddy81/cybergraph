@@ -41,6 +41,7 @@ class MockModel:
 
 
 def test_fusion_engine_trained_model(monkeypatch, tmp_path):
+    monkeypatch.setenv("CYBERGRAPH_ALLOW_UNVERIFIED_MODELS", "1")
     mock_model_path = str(tmp_path / "fusion_model.pkl")
     joblib.dump(MockModel(), mock_model_path)
     monkeypatch.setattr("modules.fusion_engine._MODEL_PATH", mock_model_path)
