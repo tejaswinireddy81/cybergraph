@@ -185,8 +185,16 @@ def verify_read_viewer_access(authorized_devices_lookup_func=None) -> bool:
         else:
             return True
 
-    # If running in local development on direct loopback and not behind untrusted proxy
-    if client_ip in ("127.0.0.1", "::1", "localhost") and os.environ.get("CYBERGRAPH_REQUIRE_VIEWER_AUTH") != "1":
+    # Check if client is server's own local IP or loopback
+    srv_ip = None
+    try:
+        import app as main_app
+        srv_ip = main_app.get_server_local_ip()
+    except Exception:
+        pass
+
+    is_server_host = client_ip in ("127.0.0.1", "::1", "localhost") or (srv_ip and client_ip == srv_ip)
+    if is_server_host and os.environ.get("CYBERGRAPH_REQUIRE_VIEWER_AUTH") != "1":
         return True
 
     return False

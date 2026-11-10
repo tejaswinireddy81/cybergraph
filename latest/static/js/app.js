@@ -608,6 +608,54 @@ fetchCsrfToken();
             return String(str).replace(/[^0-9a-zA-Z.:_-]/g, '');
         }
 
+        let fwMode = 'dry-run';
+
+        function renderFirewallMode() {
+            const b = document.getElementById('btn-fw-mode');
+            if (!b) return;
+            if (fwMode === 'enforce') {
+                b.innerText = '\u26A0 FIREWALL: ENFORCE';
+                b.style.background = 'rgba(255,0,85,0.25)';
+                b.style.borderColor = 'var(--critical-crimson)';
+                b.style.color = 'var(--critical-crimson)';
+                b.title = 'ENFORCE: admin-confirmed blocks run real OS firewall commands. Click to return to dry-run.';
+            } else {
+                b.innerText = '\uD83D\uDD12 FIREWALL: DRY-RUN';
+                b.style.background = 'rgba(16,185,129,0.15)';
+                b.style.borderColor = 'var(--emerald-green)';
+                b.style.color = 'var(--emerald-green)';
+                b.title = 'DRY-RUN: no OS firewall command is ever executed. Click to enable enforce mode.';
+            }
+        }
+
+        async function refreshFirewallMode() {
+            try {
+                const res = await fetch('/api/firewall/mode', { credentials: 'same-origin' });
+                if (!res.ok) return;
+                const data = await res.json();
+                if (data.mode) { fwMode = data.mode; renderFirewallMode(); }
+            } catch (e) { /* non-fatal */ }
+        }
+
+        async function toggleFirewallMode() {
+            let body;
+            if (fwMode === 'enforce') {
+                if (!confirm('Return the firewall to DRY-RUN? (Blocks will be simulated only.)')) return;
+                body = { mode: 'dry-run' };
+            } else {
+                const typed = prompt('ENFORCE MODE lets admin-confirmed blocks run REAL firewall commands on this server.\n\nType ENFORCE to enable:');
+                if (typed !== 'ENFORCE') { if (typed !== null) alert('Not enabled: you must type ENFORCE exactly.'); return; }
+                body = { mode: 'enforce', confirm: 'ENFORCE' };
+            }
+            try {
+                const res = await postAdmin('/api/firewall/mode', body);
+                const data = await res.json();
+                if (!res.ok) { alert('[FIREWALL MODE] ' + (data.message || ('HTTP ' + res.status))); return; }
+                fwMode = data.mode;
+                renderFirewallMode();
+            } catch (e) { alert('[FIREWALL MODE] ' + e.message); }
+        }
+
         let pendingBlockIp = null;
 
         function executeRealBlock(targetIp) {
@@ -631,8 +679,28 @@ fetchCsrfToken();
             statusBox.innerText = '';
             const btn = document.getElementById('btn-do-real-block');
             btn.disabled = false;
-            btn.innerText = 'Execute Real OS Block';
+            applyFirewallModeToModal();
             modal.style.display = 'flex';
+        }
+
+        function applyFirewallModeToModal() {
+            const btn = document.getElementById('btn-do-real-block');
+            const note = document.getElementById('fw-confirm-mode-note');
+            const lead = document.getElementById('fw-confirm-lead');
+            if (!btn || !note) return;
+            if (fwMode === 'enforce') {
+                btn.innerText = 'Execute Real OS Block';
+                note.style.background = 'rgba(255,0,85,0.2)';
+                note.style.color = 'var(--critical-crimson)';
+                note.innerText = 'ENFORCE MODE: this will run a real firewall command on the server.';
+                if (lead) lead.innerText = 'You are about to enforce a direct packet-level drop rule at the operating system kernel/firewall.';
+            } else {
+                btn.innerText = 'Record Simulated Block (dry-run)';
+                note.style.background = 'rgba(16,185,129,0.2)';
+                note.style.color = 'var(--emerald-green)';
+                note.innerText = 'DRY-RUN MODE: no OS firewall command will be executed. The block is only recorded in the audit log. Switch to ENFORCE (top bar) to block for real.';
+                if (lead) lead.innerText = 'You are about to record a simulated block.';
+            }
         }
 
         function closeFirewallModal() {
@@ -647,10 +715,10 @@ fetchCsrfToken();
             const btn = document.getElementById('btn-do-real-block');
             const statusBox = document.getElementById('fw-confirm-status');
             btn.disabled = true;
-            btn.innerText = 'Applying Rule...';
+            btn.innerText = (fwMode === 'enforce') ? 'Applying Rule...' : 'Recording...';
             
             try {
-                const res = await postAdmin('/api/execute_real_block', { ip: clean });
+                const res = await postAdmin('/api/execute_real_block', { ip: clean, confirm: true });
                 const data = await res.json();
                 statusBox.style.display = 'block';
                 if (!res.ok) {
@@ -680,7 +748,7 @@ fetchCsrfToken();
 
         async function performRealBlock(clean) {
             try {
-                const res = await postAdmin('/api/execute_real_block', { ip: clean });
+                const res = await postAdmin('/api/execute_real_block', { ip: clean, confirm: true });
                 const data = await res.json();
                 if (!res.ok) {
                     alert(`[FIREWALL ACTION ERROR ${res.status}]:\n${data.message || 'Block action failed'}`);
@@ -1081,22 +1149,39 @@ fetchCsrfToken();
             }
         }
 
+        let consecutivePollErrors = 0;
         async function fetchStreamStep() {
             if (isPolling) return;
             isPolling = true;
 
+            const controller = new AbortController();
+            const timeoutId = setTimeout(() => controller.abort(), 2000);
+
             try {
-                const res = await fetch('/api/stream_step');
+                const res = await fetch('/api/stream_step', { signal: controller.signal });
+                clearTimeout(timeoutId);
                 if (!res.ok) {
+                    consecutivePollErrors++;
                     showConnectionBanner();
                     return;
                 }
+                consecutivePollErrors = 0;
                 hideConnectionBanner();
                 const data = await res.json();
                 handleStreamData(data);
             } catch(e) {
-                console.error("Stream step network error:", e);
+                clearTimeout(timeoutId);
+                consecutivePollErrors++;
+                console.warn("Stream step network poll:", e.message || e);
                 showConnectionBanner();
+                // If browser was loaded via LAN IP (e.g. 192.168.1.37) and Wi-Fi was toggled off,
+                // seamlessly redirect to localhost so the offline dataset continues streaming
+                if (consecutivePollErrors >= 3 && window.location.hostname !== 'localhost' && window.location.hostname !== '127.0.0.1') {
+                    try {
+                        const localCheck = await fetch('http://localhost:' + (window.location.port || '5000') + '/api/stream_step', { mode: 'no-cors' });
+                        window.location.href = 'http://localhost:' + (window.location.port || '5000');
+                    } catch (_) {}
+                }
             } finally {
                 isPolling = false;
             }
@@ -1228,18 +1313,21 @@ fetchCsrfToken();
             const btnNorm = document.getElementById('btn-normal');
             const btnOff = document.getElementById('btn-offline');
 
+            const isLiveSource = data.stats.current_data_source && data.stats.current_data_source.includes('LIVE');
+            const isOfflineSource = data.stats.current_data_source && (data.stats.current_data_source.includes('OFFLINE') || data.stats.current_data_source.includes('NF-UNSW'));
+
             if (data.mode === 'attack') {
                 if (btnAtk) btnAtk.style.boxShadow = '0 0 15px rgba(255, 0, 85, 0.6)';
                 if (btnNorm) btnNorm.style.boxShadow = 'none';
                 if (btnOff) btnOff.style.boxShadow = 'none';
-            } else if (data.mode === 'offline') {
-                if (btnOff) btnOff.style.boxShadow = '0 0 15px rgba(14, 165, 233, 0.8)';
-                if (btnNorm) btnNorm.style.boxShadow = 'none';
-                if (btnAtk) btnAtk.style.boxShadow = 'none';
-            } else {
+            } else if (isLiveSource) {
                 if (btnNorm) btnNorm.style.boxShadow = '0 0 15px rgba(0, 255, 157, 0.6)';
                 if (btnAtk) btnAtk.style.boxShadow = 'none';
                 if (btnOff) btnOff.style.boxShadow = 'none';
+            } else if (isOfflineSource || data.mode === 'offline') {
+                if (btnOff) btnOff.style.boxShadow = '0 0 15px rgba(14, 165, 233, 0.8)';
+                if (btnNorm) btnNorm.style.boxShadow = 'none';
+                if (btnAtk) btnAtk.style.boxShadow = 'none';
             }
 
             function setGraphTitle(accentColor, titleText) {
@@ -1252,15 +1340,9 @@ fetchCsrfToken();
             }
 
             if (data.stats.current_data_source.includes('LIVE')) {
-                if (data.stats.current_data_source.includes('DISCONNECTED') || data.stats.current_data_source.includes('NO PHYSICAL')) {
-                    dsBadge.style.color = 'var(--warning-amber)';
-                    dsBadge.style.borderColor = 'var(--warning-amber)';
-                    setGraphTitle('var(--warning-amber)', 'Live Wi-Fi Standby (No Packets Captured)');
-                } else {
-                    dsBadge.style.color = 'var(--emerald-green)';
-                    dsBadge.style.borderColor = 'var(--emerald-green)';
-                    setGraphTitle('var(--emerald-green)', 'Live Wi-Fi Bipartite Graph Radar (HOST ↔ SERVICE)');
-                }
+                dsBadge.style.color = 'var(--emerald-green)';
+                dsBadge.style.borderColor = 'var(--emerald-green)';
+                setGraphTitle('var(--emerald-green)', 'Live Wi-Fi Bipartite Graph Radar (HOST ↔ SERVICE)');
             } else if (data.stats.current_data_source.includes('ATTACK')) {
                 dsBadge.style.color = 'var(--critical-crimson)';
                 dsBadge.style.borderColor = 'var(--critical-crimson)';
@@ -1355,6 +1437,15 @@ fetchCsrfToken();
                 sseSource.onerror = () => {
                     sseActive = false;
                     showConnectionBanner();
+                    if (sseSource) {
+                        try { sseSource.close(); } catch (_) {}
+                        sseSource = null;
+                    }
+                    setTimeout(() => {
+                        if (!sseActive && !sseSource) {
+                            initSSE();
+                        }
+                    }, 3000);
                 };
             } catch(e) {
                 sseActive = false;
@@ -1462,6 +1553,7 @@ document.addEventListener('click', (e) => {
                         closeAdminAuthModal();
                         updateDeviceAccessSection();
                         refreshBlockHistory();
+                        refreshFirewallMode();
                     }, 800);
                 } else {
                     if (statusDiv) {
@@ -1503,6 +1595,11 @@ document.addEventListener('click', (e) => {
         });
 
 function initStaticEventListeners() {
+    const btnFwMode = document.getElementById('btn-fw-mode');
+    if (btnFwMode) btnFwMode.addEventListener('click', toggleFirewallMode);
+    refreshFirewallMode();
+    setInterval(refreshFirewallMode, 15000);
+
     const btnOpenBlockHist = document.getElementById('btn-open-block-history');
     if (btnOpenBlockHist) btnOpenBlockHist.addEventListener('click', openBlockHistoryModal);
 

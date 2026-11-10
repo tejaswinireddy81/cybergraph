@@ -115,3 +115,15 @@ desktop.ini
 # Temporary backup files
 *.backup_*
 *.backup-*
+
+# ==============================
+# Experiment artifacts - never committed
+# ==============================
+# candidate models from experiment/retraining runs (production models/ stays separate)
+**/models_candidates/
+# automatic backups of models/ taken before any overwrite
+**/models_backup/
+# lab network captures (may contain real hostnames/IPs)
+**/data/lab_captures/
+# external benchmark datasets
+**/data/external/

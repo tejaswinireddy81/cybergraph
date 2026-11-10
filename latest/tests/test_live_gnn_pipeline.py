@@ -9,6 +9,7 @@ strict FeatureSchemaValidator (LiveTrafficEngine raises ValueError on missing fe
 Original test had only ~20 keys, missing 36 of the 47 required NF-UNSW-NB15 features.
 """
 
+import pytest
 import os
 import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -103,6 +104,7 @@ def make_complete_sample_flow():
     }
 
 
+@pytest.mark.requires_models
 def test_end_to_end_live_pipeline():
     # 1. Initialize Engines
     traffic_engine = LiveTrafficEngine()

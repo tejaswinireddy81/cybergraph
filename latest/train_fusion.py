@@ -26,13 +26,14 @@ from sklearn.metrics import classification_report, roc_auc_score
 
 from modules.gat import GATModel
 from train_gnn import build_host_graph
+from config.paths import resolve_models_dir, guard_output_dir
 
 warnings.filterwarnings("ignore")
 np.random.seed(42)
 
 HERE = os.path.dirname(__file__)
 DATASET_PATH = os.path.join(HERE, "NF-UNSW-NB15-v3.csv")
-MODELS_DIR = os.path.join(HERE, "models")
+MODELS_DIR = resolve_models_dir()
 OUT_DIR = os.path.join(HERE, "outputs")
 
 # duplicated from train_models.py (NOT imported — that module runs training
@@ -62,6 +63,8 @@ FEATURE_COLS = [
 
 
 def main():
+    # legacy RF+AE+GAT fusion: writes models/fusion_model.pkl, the SAME file name as the live fusion model
+    guard_output_dir(MODELS_DIR, targets=["fusion_model.pkl"])
     print("Loading dataset & trained artifacts …")
     df = pd.read_csv(DATASET_PATH)
 

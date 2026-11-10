@@ -17,6 +17,9 @@ device_bp = Blueprint("device_bp", __name__)
 
 
 def _get_app_context():
+    import sys
+    if "__main__" in sys.modules and hasattr(sys.modules["__main__"], "get_authorized_devices"):
+        return sys.modules["__main__"]
     import app as main_app
     return main_app
 
@@ -31,6 +34,7 @@ def api_device_requests():
     pending_list = main_app.get_pending_requests()
     return jsonify({
         "status": "SUCCESS",
+        "is_admin": main_app.is_admin_request(),
         "state_version": state_ver,
         "authorized_devices": auth_list,
         "pending_requests": pending_list,
@@ -53,15 +57,20 @@ def approve_device():
             "message": "Forbidden: Administrative access required"
         }), 403
 
-    data = request.get_json(silent=True) or {}
-    req_id = data.get("request_id") or request.args.get("request_id")
-    if not req_id:
-        return jsonify({"status": "ERROR", "message": "Missing request_id"}), 400
+    req_id = request.args.get("request_id") or request.args.get("device_id") or request.args.get("ip")
+    if not req_id and request.is_json:
+        data = request.get_json(silent=True) or {}
+        req_id = data.get("request_id") or data.get("device_id") or data.get("ip")
 
-    success = main_app.approve_device_request(req_id)
-    if success:
-        return jsonify({"status": "SUCCESS", "message": f"Device request {req_id} approved."})
-    return jsonify({"status": "ERROR", "message": f"Device request {req_id} not found."}), 404
+    if not req_id:
+        return jsonify({"status": "ERROR", "message": "Missing request_id, device_id, or ip parameter"}), 400
+
+    res = main_app.approve_device_request(req_id)
+    if res:
+        with main_app.state_lock:
+            main_app.shared_state["state_version"] += 1
+        return jsonify({"status": "SUCCESS", "message": f"Device request '{req_id}' approved", "approved_device": res})
+    return jsonify({"status": "ERROR", "message": f"Pending request or device '{req_id}' not found"}), 404
 
 
 @device_bp.route("/api/reject_device", methods=["POST"])
@@ -80,15 +89,20 @@ def reject_device():
             "message": "Forbidden: Administrative access required"
         }), 403
 
-    data = request.get_json(silent=True) or {}
-    req_id = data.get("request_id") or request.args.get("request_id")
-    if not req_id:
-        return jsonify({"status": "ERROR", "message": "Missing request_id"}), 400
+    req_id = request.args.get("request_id") or request.args.get("device_id") or request.args.get("ip")
+    if not req_id and request.is_json:
+        data = request.get_json(silent=True) or {}
+        req_id = data.get("request_id") or data.get("device_id") or data.get("ip")
 
-    success = main_app.reject_device_request(req_id)
-    if success:
-        return jsonify({"status": "SUCCESS", "message": f"Device request {req_id} rejected."})
-    return jsonify({"status": "ERROR", "message": f"Device request {req_id} not found."}), 404
+    if not req_id:
+        return jsonify({"status": "ERROR", "message": "Missing request_id, device_id, or ip parameter"}), 400
+
+    ok = main_app.reject_device_request(req_id)
+    if ok:
+        with main_app.state_lock:
+            main_app.shared_state["state_version"] += 1
+        return jsonify({"status": "SUCCESS", "message": f"Device request '{req_id}' rejected"})
+    return jsonify({"status": "ERROR", "message": f"Request '{req_id}' not found"}), 404
 
 
 @device_bp.route("/api/revoke_device", methods=["POST"])
@@ -107,13 +121,18 @@ def revoke_device():
             "message": "Forbidden: Administrative access required"
         }), 403
 
-    data = request.get_json(silent=True) or {}
-    device_token = data.get("device_token") or request.args.get("device_token")
-    if not device_token:
-        return jsonify({"status": "ERROR", "message": "Missing device_token"}), 400
+    req_id = request.args.get("device_id") or request.args.get("ip") or request.args.get("request_id") or request.args.get("device_token")
+    if not req_id and request.is_json:
+        data = request.get_json(silent=True) or {}
+        req_id = data.get("device_id") or data.get("ip") or data.get("request_id") or data.get("device_token")
 
-    success = main_app.revoke_device_authorization(device_token)
-    if success:
-        return jsonify({"status": "SUCCESS", "message": "Device authorization revoked."})
-    return jsonify({"status": "ERROR", "message": "Device not found."}), 404
+    if not req_id:
+        return jsonify({"status": "ERROR", "message": "Missing device_id, ip, or device_token parameter"}), 400
+
+    ok = main_app.revoke_device_authorization(req_id)
+    if ok:
+        with main_app.state_lock:
+            main_app.shared_state["state_version"] += 1
+        return jsonify({"status": "SUCCESS", "message": f"Device '{req_id}' authorization revoked"})
+    return jsonify({"status": "ERROR", "message": f"Device '{req_id}' not found or cannot be revoked"}), 404
 

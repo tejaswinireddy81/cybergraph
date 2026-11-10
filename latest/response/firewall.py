@@ -62,7 +62,7 @@ def _is_valid_ip(ip: str) -> bool:
 
 class FirewallController:
     # Hardcoded whitelist to prevent self-inflicted DoS / locking out local host
-    WHITELIST = {"127.0.0.1", "::1", "0.0.0.0", "localhost"}
+    WHITELIST = {"127.0.0.1", "::1", "0.0.0.0", "localhost"}  # nosec B104 - never-block list, not a socket bind
 
     def __init__(
         self,

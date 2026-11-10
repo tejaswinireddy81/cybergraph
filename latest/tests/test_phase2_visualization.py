@@ -38,6 +38,7 @@ def setup_phase2_env():
     yield
 
 
+@pytest.mark.requires_models
 def test_repeated_connections_to_port_5000_aggregate_into_one():
     """Requirement: Repeated connections from same system to port 5000 aggregate into one logical edge."""
     client_ip = "10.160.36.186"
@@ -68,6 +69,7 @@ def test_repeated_connections_to_port_5000_aggregate_into_one():
     assert matching_edges[0]["count"] == 5
 
 
+@pytest.mark.requires_models
 def test_preserve_meaningful_differences_across_services_and_protocols():
     """Requirement: Preserve differences in source, destination, protocol, and service."""
     benign_sub = app_module.df_stream_pool[app_module.df_stream_pool["label_enc"] == 0]

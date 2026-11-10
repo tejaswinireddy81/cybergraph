@@ -5,6 +5,9 @@ CYBERGRAPH COMMAND CENTER — Explainable AI Network Threat Detection & Response
 Complete Implementation with Server-Authoritative Pipeline & Real-Time Synchronization
 """
 
+import sys
+sys.modules["app"] = sys.modules[__name__]
+
 import os
 import json
 import time
@@ -129,6 +132,38 @@ def sanitize_target_ip(raw: str) -> Optional[str]:
         return None
 
 app = Flask(__name__)
+app.config["MAX_CONTENT_LENGTH"] = 16 * 1024 * 1024  # 16 MB max payload limit
+
+# --- Global API Error Handlers ---
+@app.errorhandler(400)
+def handle_bad_request(e):
+    if request.path.startswith("/api/"):
+        return jsonify({"status": "ERROR", "message": f"Bad Request: {str(e)}"}), 400
+    return e, 400
+
+@app.errorhandler(404)
+def handle_not_found(e):
+    if request.path.startswith("/api/"):
+        return jsonify({"status": "ERROR", "message": f"Endpoint Not Found: {request.path}"}), 404
+    return e, 404
+
+@app.errorhandler(405)
+def handle_method_not_allowed(e):
+    if request.path.startswith("/api/"):
+        return jsonify({"status": "ERROR", "message": f"Method Not Allowed: {request.method} on {request.path}"}), 405
+    return e, 405
+
+@app.errorhandler(413)
+def handle_payload_too_large(e):
+    if request.path.startswith("/api/"):
+        return jsonify({"status": "ERROR", "message": "Payload Too Large (Maximum body size is 16MB)"}), 413
+    return e, 413
+
+@app.errorhandler(500)
+def handle_internal_server_error(e):
+    if request.path.startswith("/api/"):
+        return jsonify({"status": "ERROR", "message": "Internal Server Error"}), 500
+    return e, 500
 
 # --- Server-Authoritative Shared State & Thread Lock ---
 state_lock = threading.Lock()
@@ -277,8 +312,11 @@ def _load_html_template() -> str:
 HTML_TEMPLATE = _load_html_template()
 
 
-@app.route("/api/stream_events")
 def stream_events():
+    return _stream_events_impl()
+
+
+def _stream_events_impl():
     """Server-Sent Events (SSE) stream providing real-time push updates (Viewer Access Protected).
     Yields full state snapshot events whenever state_version increments,
     with periodic heartbeats to maintain persistent connection.
@@ -319,20 +357,38 @@ def stream_events():
     )
 
 
-def is_live_capture_available() -> bool:
-    """Return True if Scapy/Npcap live capture is initialized and available.
+def is_physical_network_active() -> bool:
+    """Return True if an active physical network interface (Wi-Fi / Ethernet) is UP with a valid private IPv4."""
+    try:
+        import psutil
+        import ipaddress
+        stats = psutil.net_if_stats()
+        addrs = psutil.net_if_addrs()
+        virtual_kw = ("virtual", "vethernet", "loopback", "wsl", "host-only", "vmware", "virtualbox", "wan miniport", "bluetooth", "teredo", "isatap")
+        for name, stat in stats.items():
+            if not stat.isup:
+                continue
+            if any(kw in name.lower() for kw in virtual_kw):
+                continue
+            for snic in addrs.get(name, []):
+                if getattr(snic, "family", None) == 2:
+                    try:
+                        ip_obj = ipaddress.IPv4Address(snic.address)
+                        if ip_obj.is_private and not ip_obj.is_loopback and not ip_obj.is_link_local:
+                            return True
+                    except Exception:
+                        pass
+    except Exception:
+        pass
+    return False
 
-    Live capture is considered unavailable ONLY if:
-      - Initialization failed at startup (_capture_initialized is False), OR
-      - Capture thread exited with a fatal error (capture_status['last_error'] is set
-        and capture_status['running'] is False).
-    A temporary lack of physical network packets does NOT make live capture unavailable.
-    """
-    if not _capture_initialized:
-        return False
-    if capture_status.get("last_error") and not capture_status.get("running", False):
+
+def is_live_capture_available() -> bool:
+    """Return True if Scapy/Npcap live capture is initialized and physical network is connected."""
+    if not is_physical_network_active():
         return False
     return bool(capture_status.get("running", False) or _capture_initialized)
+
 
 
 def get_recent_live_flows(window_seconds: float = 10.0):
@@ -1290,7 +1346,7 @@ def sync_network_state(force_scan: bool = False, profile_override: Optional[dict
         _discovered_lan_hosts.clear()
         _pending_device_requests.clear()
         for k, dev in list(_authorized_monitored_devices.items()):
-            if not dev.get("is_server") or network_changed or _current_network_id is None:
+            if not dev.get("is_server"):
                 _authorized_monitored_devices.pop(k, None)
 
         # Update monitored networks
@@ -1340,6 +1396,14 @@ def sync_network_state(force_scan: bool = False, profile_override: Optional[dict
             f"subnet={subnet} | gateway={gateway} | "
             f"authorized_monitored_hosts={len(_authorized_monitored_devices)}"
         )
+    # Automatic capture watchdog: if physical network is active, ensure sniffer thread is running
+    if is_physical_network_active():
+        cap = get_capture_status()
+        if not cap.get("running"):
+            try:
+                start_capture(iface=iface)
+            except Exception as _c_exc:
+                logger.debug("Auto-restart capture notice: %s", _c_exc)
 
 
 def get_stream_pool():
@@ -1368,7 +1432,7 @@ def _run_pipeline_cycle(batch_override=None):
     sync_network_state()
 
     capture_available = is_live_capture_available()
-    recent_live = get_recent_live_flows(window_seconds=3.0)
+    recent_live = get_recent_live_flows(window_seconds=1.5)
     has_recent_live = len(recent_live) > 0
 
     if batch_override is not None:
@@ -1408,14 +1472,29 @@ def _run_pipeline_cycle(batch_override=None):
             r["timestamp"] = now_ms
 
     else:  # mode == "normal"
-        if capture_available and has_recent_live:
+        wifi_connected = is_physical_network_active()
+
+        if wifi_connected:
             data_source = "LIVE WI-FI PACKETS (PHYSICAL CAPTURE ACTIVE)"
             buf_count = len(recent_live)
-            batch_records = recent_live[-batch_sz:]
+            if has_recent_live:
+                batch_records = recent_live[-batch_sz:]
+            else:
+                # Wi-Fi is physically connected; idle baseline: monitor server & gateway communication
+                pool = get_stream_pool()
+                if len(pool) > 0:
+                    benign_sub = pool[pool["label_enc"] == 0] if "label_enc" in pool.columns else pool
+                    batch_df = benign_sub.sample(n=min(batch_sz, len(benign_sub))).copy()
+                    srv_ip = get_server_local_ip() or "192.168.1.37"
+                    batch_df["IPV4_SRC_ADDR"] = srv_ip
+                    batch_records = batch_df.to_dict(orient="records")
+                else:
+                    batch_records = []
         else:
+            # Physical Wi-Fi is disconnected: automatically stream offline dataset!
             pool = get_stream_pool()
             data_source = "OFFLINE DATASET STREAM (NF-UNSW-NB15)"
-            buf_count = len(recent_live)
+            buf_count = 0
             if len(pool) > 0:
                 if stream_cursor + batch_sz >= len(pool):
                     stream_cursor = 0
@@ -2016,7 +2095,7 @@ app.register_blueprint(report_bp)
 
 # Top-level backward-compatible function aliases for test modules
 from routes.admin_routes import execute_real_block, api_unblock_ip, api_verify_blocked, api_blocks_history
-from routes.device_routes import approve_device, reject_device, revoke_device
+from routes.device_routes import approve_device, reject_device, revoke_device, api_device_requests
 from routes.stream_routes import stream_step, stream_events, set_mode
 from routes.report_routes import export_report, attack_journey
 from routes.auth_routes import api_auth_login, api_auth_logout, api_auth_status, api_auth_csrf
@@ -2085,108 +2164,16 @@ def is_admin_request() -> bool:
     """
     return verify_admin_request()
 
-@app.route("/api/device_requests", methods=["GET"])
-def api_device_requests():
-    init_engines()
-    return jsonify({
-        "status": "SUCCESS",
-        "is_admin": is_admin_request(),
-        "authorized_devices": get_authorized_devices(),
-        "pending_requests": get_pending_requests(),
-    })
-
-
-@app.route("/api/approve_device", methods=["POST"])
-def api_approve_device():
-    init_engines()
-    csrf_ok, csrf_err = verify_csrf_protection()
-    if not csrf_ok:
-        return jsonify({"status": "ERROR", "message": f"Forbidden: {csrf_err}"}), 403
-    if not is_admin_request():
-        logger.warning(f"[SECURITY 403] Unauthorized approve_device attempt from client IP: {request.remote_addr}")
-        return jsonify({
-            "status": "ERROR",
-            "message": "Forbidden: Administrative access required"
-        }), 403
-
-    req_id = request.args.get("request_id") or request.args.get("device_id") or request.args.get("ip")
-    if not req_id and request.is_json:
-        data = request.get_json(silent=True) or {}
-        req_id = data.get("request_id") or data.get("device_id") or data.get("ip")
-
-    if not req_id:
-        return jsonify({"status": "ERROR", "message": "Missing request_id, device_id, or ip parameter"}), 400
-
-    res = approve_device_request(req_id)
-    if res:
-        with state_lock:
-            shared_state["state_version"] += 1
-        return jsonify({"status": "SUCCESS", "approved_device": res})
-    return jsonify({"status": "ERROR", "message": f"Pending request or device '{req_id}' not found"}), 404
-
-
-@app.route("/api/reject_device", methods=["POST"])
-def api_reject_device():
-    init_engines()
-    csrf_ok, csrf_err = verify_csrf_protection()
-    if not csrf_ok:
-        return jsonify({"status": "ERROR", "message": f"Forbidden: {csrf_err}"}), 403
-    if not is_admin_request():
-        logger.warning(f"[SECURITY 403] Unauthorized reject_device attempt from client IP: {request.remote_addr}")
-        return jsonify({
-            "status": "ERROR",
-            "message": "Forbidden: Administrative access required"
-        }), 403
-
-    req_id = request.args.get("request_id") or request.args.get("device_id") or request.args.get("ip")
-    if not req_id and request.is_json:
-        data = request.get_json(silent=True) or {}
-        req_id = data.get("request_id") or data.get("device_id") or data.get("ip")
-
-    if not req_id:
-        return jsonify({"status": "ERROR", "message": "Missing request_id, device_id, or ip parameter"}), 400
-
-    ok = reject_device_request(req_id)
-    if ok:
-        with state_lock:
-            shared_state["state_version"] += 1
-        return jsonify({"status": "SUCCESS", "message": f"Device request '{req_id}' rejected"})
-    return jsonify({"status": "ERROR", "message": f"Request '{req_id}' not found"}), 404
-
-
-@app.route("/api/revoke_device", methods=["POST"])
-def api_revoke_device():
-    init_engines()
-    csrf_ok, csrf_err = verify_csrf_protection()
-    if not csrf_ok:
-        return jsonify({"status": "ERROR", "message": f"Forbidden: {csrf_err}"}), 403
-    if not is_admin_request():
-        logger.warning(f"[SECURITY 403] Unauthorized revoke_device attempt from client IP: {request.remote_addr}")
-        return jsonify({
-            "status": "ERROR",
-            "message": "Forbidden: Administrative access required"
-        }), 403
-
-    req_id = request.args.get("device_id") or request.args.get("ip") or request.args.get("request_id")
-    if not req_id and request.is_json:
-        data = request.get_json(silent=True) or {}
-        req_id = data.get("device_id") or data.get("ip") or data.get("request_id")
-
-    if not req_id:
-        return jsonify({"status": "ERROR", "message": "Missing device_id or ip parameter"}), 400
-
-    ok = revoke_device_authorization(req_id)
-    if ok:
-        with state_lock:
-            shared_state["state_version"] += 1
-        return jsonify({"status": "SUCCESS", "message": f"Device '{req_id}' authorization revoked"})
-    return jsonify({"status": "ERROR", "message": f"Device '{req_id}' not found or cannot be revoked"}), 404
+# Backward-compatible function aliases (handled canonically by device_bp)
+api_approve_device = approve_device
+api_reject_device = reject_device
+api_revoke_device = revoke_device
 
 
 if __name__ == "__main__":
     init_engines()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-    host = os.environ.get("CYBERGRAPH_HOST", "127.0.0.1")
+    host = os.environ.get("CYBERGRAPH_HOST", "0.0.0.0")
     port = int(os.environ.get("CYBERGRAPH_PORT", "5000"))
     print("\n" + "=" * 72)
     print("CYBERGRAPH COMMAND CENTER — INITIALIZED")

@@ -5,6 +5,7 @@ Modular Flask Blueprint for Export Reports and Multi-Hop Attack Journeys.
 """
 
 import copy
+import html
 import time
 from flask import Blueprint, request, jsonify, Response
 from modules.auth_manager import verify_read_viewer_access
@@ -13,6 +14,9 @@ report_bp = Blueprint("report_bp", __name__)
 
 
 def _get_app_context():
+    import sys
+    if "__main__" in sys.modules and hasattr(sys.modules["__main__"], "fw_executor"):
+        return sys.modules["__main__"]
     import app as main_app
     return main_app
 
@@ -109,36 +113,40 @@ def export_report():
             else:
                 ts_str = time.strftime("%Y-%m-%d %H:%M:%S")
 
-            lvl = ev.get("level", "Level 1 — Normal")
-            badge_color = ev.get("badge_color", "#10b981")
+            lvl = html.escape(str(ev.get("level", "Level 1 — Normal")))
+            badge_color = html.escape(str(ev.get("badge_color", "#10b981")))
             risk_score = float(ev.get("risk_score", 0.0))
-            src = ev.get("source_host", "UNKNOWN")
-            dst = ev.get("target_service", "UNKNOWN")
-            summary = ev.get("summary", "Normal Traffic Flow")
+            src = html.escape(str(ev.get("source_host", "UNKNOWN")))
+            dst = html.escape(str(ev.get("target_service", "UNKNOWN")))
+            summary = html.escape(str(ev.get("summary", "Normal Traffic Flow")))
 
             xai = ev.get("xai_explanation", {})
             reasons = xai.get("why_this_attack_reasons", []) if isinstance(xai, dict) else []
-            reasons_html = "".join([f"<li>{r}</li>" for r in reasons]) if reasons else "<li>Baseline traffic profile match</li>"
+            reasons_html = "".join([f"<li>{html.escape(str(r))}</li>" for r in reasons]) if reasons else "<li>Baseline traffic profile match</li>"
 
             mitre_list = ev.get("mitre_mappings", [])
             mitre_html = ""
             if mitre_list:
                 mitre_badges = []
                 for m in mitre_list:
-                    mitre_badges.append(f"<span style='background:#e0f2fe; color:#0369a1; padding:2px 6px; border-radius:4px; font-weight:700;'>{m.get('technique_id')} ({m.get('technique_name')}) [{(float(m.get('confidence',0))*100):.1f}%]</span>")
+                    t_id = html.escape(str(m.get('technique_id', '')))
+                    t_name = html.escape(str(m.get('technique_name', '')))
+                    conf_pct = (float(m.get('confidence', 0)) * 100)
+                    mitre_badges.append(f"<span style='background:#e0f2fe; color:#0369a1; padding:2px 6px; border-radius:4px; font-weight:700;'>{t_id} ({t_name}) [{conf_pct:.1f}%]</span>")
                 mitre_html = f"<div style='margin-top:4px;'><strong>MITRE ATT&CK:</strong> {' '.join(mitre_badges)}</div>"
 
             rec_fw = ev.get("recommended_firewall_action", {})
-            target_ip = rec_fw.get("target_ip", src.replace("HOST:", "").replace("EXT:", "").replace("GW:", "").replace("PENDING:", ""))
-            cmd_preview = rec_fw.get("windows_netsh_rule_preview", f"netsh advfirewall firewall add rule name=\"Block-GNN-{target_ip}\" dir=in action=block remoteip={target_ip}")
+            raw_target_ip = str(rec_fw.get("target_ip", ev.get("source_host", "UNKNOWN"))).replace("HOST:", "").replace("EXT:", "").replace("GW:", "").replace("PENDING:", "")
+            target_ip = html.escape(raw_target_ip)
+            cmd_preview = html.escape(str(rec_fw.get("windows_netsh_rule_preview", f"netsh advfirewall firewall add rule name=\"Block-GNN-{raw_target_ip}\" dir=in action=block remoteip={raw_target_ip}")))
             rec_action = f"Block IP {target_ip} via OS Firewall Rule<br><code style='background:#f1f5f9; padding:2px 4px; font-size:11px;'>{cmd_preview}</code>" if risk_score >= 0.50 else "Monitor traffic; no blocking action required."
 
-            is_ip_blocked = (target_ip in sim_blocked) or (target_ip in real_blocked)
+            is_ip_blocked = (raw_target_ip in sim_blocked) or (raw_target_ip in real_blocked)
             block_status_html = f"<span style='color:#ef4444; font-weight:700;'>BLOCKED</span>" if is_ip_blocked else "<span style='color:#10b981; font-weight:700;'>ALLOWED / MONITORING</span>"
 
             threat_rows_html += f"""
             <tr style="border-bottom: 1px solid #e2e8f0;">
-                <td style="padding: 10px; font-family: monospace; font-size: 11px;">{ts_str}</td>
+                <td style="padding: 10px; font-family: monospace; font-size: 11px;">{html.escape(str(ts_str))}</td>
                 <td style="padding: 10px;"><span style="background:{badge_color}; color:#fff; padding:3px 8px; border-radius:4px; font-weight:700; font-size:11px;">{lvl}</span><br><small>Risk: {risk_score:.4f}</small></td>
                 <td style="padding: 10px;"><strong>Src:</strong> {src}<br><strong>Dst:</strong> {dst}</td>
                 <td style="padding: 10px; font-size: 12px;">
@@ -156,11 +164,11 @@ def export_report():
     fw_rows_html = ""
     if fw_history:
         for act in reversed(fw_history[-30:]):
-            act_ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(act.get("timestamp", time.time())))
-            act_type = act.get("action", "UNKNOWN")
-            act_ip = act.get("ip", "-")
-            act_mode = act.get("execution_mode", "SIMULATED_MEMORY_ONLY")
-            act_status = act.get("status", "-")
+            act_ts = html.escape(time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(act.get("timestamp", time.time()))))
+            act_type = html.escape(str(act.get("action", "UNKNOWN")))
+            act_ip = html.escape(str(act.get("ip", "-")))
+            act_mode = html.escape(str(act.get("execution_mode", "SIMULATED_MEMORY_ONLY")))
+            act_status = html.escape(str(act.get("status", "-")))
             fw_rows_html += f"""
             <tr style="border-bottom: 1px solid #e2e8f0;">
                 <td style="padding: 8px; font-family: monospace; font-size: 11px;">{act_ts}</td>
@@ -173,7 +181,7 @@ def export_report():
     else:
         fw_rows_html = "<tr><td colspan='5' style='text-align:center; padding:15px; color:#64748b;'>No firewall actions executed in current session.</td></tr>"
 
-    blocked_list_str = ", ".join(sorted(list(set(sim_blocked + real_blocked)))) if (sim_blocked or real_blocked) else "None"
+    blocked_list_str = html.escape(", ".join(sorted(list(set(sim_blocked + real_blocked))))) if (sim_blocked or real_blocked) else "None"
 
     report_html = f"""<!DOCTYPE html>
 <html>
@@ -199,8 +207,8 @@ def export_report():
     <div class="container">
         <h1>CYBERGRAPH COMMAND CENTER — Incident Security Audit Report</h1>
         <div class="meta-bar">
-            <span><strong>Generated:</strong> {time.strftime('%Y-%m-%d %H:%M:%S')}</span>
-            <span><strong>Active Source:</strong> {st['current_data_source']}</span>
+            <span><strong>Generated:</strong> {html.escape(time.strftime('%Y-%m-%d %H:%M:%S'))}</span>
+            <span><strong>Active Source:</strong> {html.escape(str(st.get('current_data_source', 'INITIALIZING NETWORK MONITOR...')))}</span>
             <span><strong>Auditor Mode:</strong> Real-Time Automated Defense Inspection</span>
         </div>
         <div class="kpi-grid">

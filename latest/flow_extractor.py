@@ -1,6 +1,13 @@
 """
-flow_extractor.py
-=================
+flow_extractor.py  (revision: tcp_close_mode / timestamp_source flags)
+
+Two approved fixes are integrated behind flags whose DEFAULTS equal the previous behaviour ("legacy" / "wall"), so with default
+arguments the output is bit-identical to the previous version (tests/test_extractor_flags.py compares against a frozen copy):
+    * tcp_close_mode="linger"      keep a TCP flow open through the FIN/RST teardown (no orphan flows)
+    * timestamp_source="capture"   use the packet capture timestamp (pkt.time) for all flow timing features
+plus an RLock (add_packet runs on the sniff thread, flush_expired on the flush thread) and diagnostics metadata (_close_reason,
+_midflow). See docs/extractor_investigation_and_proposal.md. The flags are NOT switched on anywhere yet.
+
 AI-Powered Network Traffic Analyzer — FLOW AGGREGATION
 
 Converts individual Scapy packets into NF-UNSW-NB15-v3-compatible flow records.
@@ -18,6 +25,8 @@ Exported flows contain all 47 features used by the trained RF and AE.
 """
 
 import logging
+import os
+import threading
 import time
 import math
 import struct
@@ -30,6 +39,8 @@ logger = logging.getLogger(__name__)
 # 10 s is enough to capture short HTTP/DNS/QUIC flows while not waiting forever.
 IDLE_TIMEOUT_S   = 10.0   # export if no packet received for this many seconds
 ACTIVE_TIMEOUT_S = 60.0   # always export long-running flows after this long
+TCP_LINGER_S     = 2.0    # [proposal] a TCP flow in FIN/RST teardown is exported after this much quiet
+TOMBSTONE_S      = 2.0    # [proposal] late packets of a just-exported connection are swallowed this long
 
 # ── L7 protocol inference from port number (best-effort) ─────────────────────
 _PORT_TO_L7: Dict[int, int] = {
@@ -122,9 +133,12 @@ class _FlowRecord:
         "npkts_256_512",
         "npkts_512_1024",
         "npkts_1024_1514",
+        # [proposal] wall-clock arrival times (expiry decisions) and TCP teardown state
+        "wall_first", "wall_last",
+        "closing", "fin_fwd", "fin_rev", "fin_first_dir", "rst_seen", "saw_syn", "close_reason",
     ]
 
-    def __init__(self, src_ip, dst_ip, src_port, dst_port, protocol, now):
+    def __init__(self, src_ip, dst_ip, src_port, dst_port, protocol, now, wall_now=None):
         self.src_ip   = src_ip
         self.dst_ip   = dst_ip
         self.src_port = src_port
@@ -137,6 +151,15 @@ class _FlowRecord:
 
         self.t_first = now
         self.t_last  = now
+        self.wall_first = now if wall_now is None else wall_now
+        self.wall_last  = self.wall_first
+        self.closing = False
+        self.fin_fwd = False
+        self.fin_rev = False
+        self.fin_first_dir = None
+        self.rst_seen = False
+        self.saw_syn = False
+        self.close_reason = None
         self.t_first_in  = None
         self.t_last_in   = None
         self.t_first_out = None
@@ -266,6 +289,16 @@ def _infer_l7(src_port: int, dst_port: int, protocol: int) -> int:
 
 FlowKey = Tuple[str, str, int, int, int]
 
+# Rollback configuration: restore historical extractor behaviour in one step
+ROLLBACK_DEFAULTS: Dict[str, object] = {
+    "tcp_close_mode": "legacy",
+    "timestamp_source": "wall",
+    "tcp_linger_s": TCP_LINGER_S,
+    "min_pkt_floor_tcp": 52,
+}
+
+MAX_ACTIVE_FLOWS: int = 50_000
+
 
 class FlowExtractor:
     """
@@ -278,7 +311,32 @@ class FlowExtractor:
         self,
         idle_timeout_s: float = IDLE_TIMEOUT_S,
         active_timeout_s: float = ACTIVE_TIMEOUT_S,
+        min_pkt_floor_tcp: int = 52,
+        tcp_close_mode: str = "legacy",      # "legacy" = export at first FIN/RST (today) | "linger"
+        tcp_linger_s: float = TCP_LINGER_S,
+        timestamp_source: str = "wall",      # "wall" = time.time() at processing (today) | "capture" = pkt.time
     ):
+        # Rollback mechanism: if CYBERGRAPH_ROLLBACK_EXTRACTOR=1 is set, immediately force legacy behaviour
+        if os.environ.get("CYBERGRAPH_ROLLBACK_EXTRACTOR") == "1":
+            tcp_close_mode = "legacy"
+            timestamp_source = "wall"
+
+        if tcp_close_mode not in ("legacy", "linger"):
+            raise ValueError("tcp_close_mode must be 'legacy' or 'linger'")
+        if timestamp_source not in ("wall", "capture"):
+            raise ValueError("timestamp_source must be 'wall' or 'capture'")
+        self._close_mode = tcp_close_mode
+        self._linger_s = float(tcp_linger_s)
+        self._ts_source = timestamp_source
+        self._lock = threading.RLock()          # capture thread (add_packet) vs flush thread (flush_expired)
+        self._ready: List[dict] = []            # flows finished outside add_packet's return value
+        self._tombstones: Dict[FlowKey, float] = {}
+        self.stray_packets_swallowed = 0        # packets of a just-closed connection that did NOT become orphan flows
+        self.capture_ts_fallbacks = 0           # packets without a usable pkt.time (wall clock used instead)
+        # min_pkt_floor_tcp: minimum TCP packet length reported in SHORTEST_FLOW_PKT / MIN_IP_PKT_LEN.
+        # Default 52 keeps the historical behaviour. 0 (or None) disables the floor so the true wire
+        # value is reported; used by the floor on/off comparison (docs/model_improvement_plan.md).
+        self._tcp_floor = int(min_pkt_floor_tcp or 0)
         self._flows: Dict[FlowKey, _FlowRecord] = {}
         self._idle_t   = idle_timeout_s
         self._active_t = active_timeout_s
@@ -290,7 +348,8 @@ class FlowExtractor:
     # ── public API ────────────────────────────────────────────────────────────
 
     def active_flow_count(self) -> int:
-        return len(self._flows)
+        with self._lock:
+            return len(self._flows)
 
     def add_packet(self, pkt) -> Optional[dict]:
         """
@@ -300,7 +359,8 @@ class FlowExtractor:
         Any internal exception is logged (not silently swallowed).
         """
         try:
-            return self._process(pkt)
+            with self._lock:
+                return self._process(pkt)
         except Exception as exc:
             self.pkt_errors += 1
             # Log at DEBUG to avoid flooding; first 5 at WARNING so user notices.
@@ -316,27 +376,69 @@ class FlowExtractor:
         Export and remove all flows that have been idle or active too long.
         Must be called from a dedicated timer thread every few seconds so that
         flows are finalized even when no new packets arrive for them.
+
+        Expiry decisions always use WALL-CLOCK arrival times (flow.wall_first / wall_last), exactly as today, so they
+        keep working for live capture and for replayed captures with old timestamps. [proposal] flows in TCP teardown
+        use the shorter linger time.
         """
-        now     = time.time()
-        expired = []
-        for key in list(self._flows):
-            flow   = self._flows[key]
-            idle   = now - flow.t_last
-            active = now - flow.t_first
-            if idle >= self._idle_t or active >= self._active_t:
+        with self._lock:
+            now = time.time()
+            expired = list(self._ready)
+            self._ready.clear()
+            for key in list(self._flows):
+                flow = self._flows[key]
+                idle = now - flow.wall_last
+                active = now - flow.wall_first
+                if self._close_mode == "linger" and flow.closing:
+                    due = idle >= self._linger_s or active >= self._active_t
+                    reason = "linger"
+                else:
+                    due = idle >= self._idle_t or active >= self._active_t
+                    reason = "active_timeout" if active >= self._active_t else "idle_timeout"
+                if due:
+                    flow.close_reason = flow.close_reason or reason
+                    rec = self._export(flow)
+                    if rec is not None:
+                        expired.append(rec)
+                    del self._flows[key]
+                    if self._close_mode == "linger" and flow.closing:
+                        self._tombstone(key, now)
+            for k in [k for k, exp in self._tombstones.items() if exp <= now]:
+                del self._tombstones[k]
+            return expired
+
+    def drain_all(self) -> List[dict]:
+        """[proposal] Finalise EVERY flow now (shutdown, tests, offline replay), regardless of timers."""
+        with self._lock:
+            out = list(self._ready)
+            self._ready.clear()
+            for key in list(self._flows):
+                flow = self._flows[key]
+                flow.close_reason = flow.close_reason or "drain"
                 rec = self._export(flow)
                 if rec is not None:
-                    expired.append(rec)
+                    out.append(rec)
                 del self._flows[key]
-        return expired
+            self._tombstones.clear()
+            return out
+
+    def _tombstone(self, key: FlowKey, now_wall: float):
+        src_ip, dst_ip, src_port, dst_port, proto = key
+        exp = now_wall + TOMBSTONE_S
+        self._tombstones[key] = exp
+        self._tombstones[(dst_ip, src_ip, dst_port, src_port, proto)] = exp
 
     # ── internal ──────────────────────────────────────────────────────────────
 
-    def _get_or_create(self, key: FlowKey, now: float) -> _FlowRecord:
+    def _get_or_create(self, key: FlowKey, now: float, wall_now: Optional[float] = None) -> _FlowRecord:
         if key not in self._flows:
+            if len(self._flows) >= MAX_ACTIVE_FLOWS:
+                # Evict the oldest idle flow to protect memory under SYN floods / resource exhaustion
+                oldest_key = min(self._flows, key=lambda k: self._flows[k].t_last)
+                del self._flows[oldest_key]
             src_ip, dst_ip, src_port, dst_port, protocol = key
             self._flows[key] = _FlowRecord(
-                src_ip, dst_ip, src_port, dst_port, protocol, now
+                src_ip, dst_ip, src_port, dst_port, protocol, now, wall_now
             )
         return self._flows[key]
 
@@ -345,7 +447,19 @@ class FlowExtractor:
         from scapy.layers.inet import IP, TCP, UDP, ICMP
         from scapy.layers.l2  import Ether
 
-        now = time.time()
+        now_wall = time.time()
+        now = now_wall
+        if self._ts_source == "capture":
+            # [proposal] capture timestamp stamped by libpcap (scapy: pkt.time). Read BEFORE any re-parse of the packet,
+            # which would lose it. Anything unusable falls back to the wall clock for that packet.
+            try:
+                pkt_ts = float(getattr(pkt, "time", 0) or 0)
+            except (TypeError, ValueError):
+                pkt_ts = 0.0
+            if pkt_ts > 0 and math.isfinite(pkt_ts):
+                now = pkt_ts
+            else:
+                self.capture_ts_fallbacks += 1
 
         # ── Safety net: re-parse generic Packet objects ───────────────────────
         # When Scapy emits "Unable to guess datalink type", every captured frame
@@ -450,8 +564,29 @@ class FlowExtractor:
                 pass
         iface_val = getattr(pkt, "sniffed_on", None)
 
-        flow = self._get_or_create(key, now)
+        if self._close_mode == "linger":
+            # [proposal] late packets of a connection that was just exported must not start orphan flows
+            exp = self._tombstones.get(key)
+            if exp is not None and exp > now_wall and not (proto == 6 and (tcp_flags & TCP_SYN) and not (tcp_flags & TCP_ACK)):
+                self.stray_packets_swallowed += 1
+                return None
+            # a fresh SYN on a flow that is already closing = port reuse: finish the old connection first
+            old = self._flows.get(key)
+            if (old is not None and old.closing and proto == 6 and (tcp_flags & TCP_SYN) and not (tcp_flags & TCP_ACK)):
+                old.close_reason = "port_reuse"
+                rec_old = self._export(old)
+                del self._flows[key]
+                if rec_old is not None:
+                    self._ready.append(rec_old)
+                is_reverse = False
+
+        flow = self._get_or_create(key, now, now_wall)
+        if now < flow.t_last:          # capture timestamps can arrive slightly out of order: never go backwards in a flow
+            now = flow.t_last
         flow.t_last = now
+        flow.wall_last = now_wall
+        if proto == 6 and (tcp_flags & TCP_SYN):
+            flow.saw_syn = True
         if not flow.src_mac and src_mac:
             flow.src_mac = src_mac if not is_reverse else dst_mac
             flow.dst_mac = dst_mac if not is_reverse else src_mac
@@ -555,11 +690,38 @@ class FlowExtractor:
             flow.icmp_type = icmp_type_val
 
         # ── Close on TCP FIN or RST ───────────────────────────────────────────
-        if proto == 6 and (tcp_flags & (TCP_FIN | TCP_RST)):
-            rec = self._export(flow)
-            del self._flows[key]
-            return rec
+        if self._close_mode == "legacy":
+            if proto == 6 and (tcp_flags & (TCP_FIN | TCP_RST)):
+                flow.close_reason = "legacy_fin_rst"
+                rec = self._export(flow)
+                del self._flows[key]
+                return rec
+            return None
 
+        # [proposal] "linger": the connection stays in the table through its teardown so the server's FIN and the
+        # final ACK join the same record (as in the NetFlow training data, where 74.5 % of benign TCP flows hold
+        # both FINs and 100 % are bidirectional).
+        if proto == 6:
+            direction_fwd = not is_reverse
+            if tcp_flags & TCP_RST:
+                flow.rst_seen = True
+                flow.closing = True
+            if tcp_flags & TCP_FIN:
+                flow.closing = True
+                if flow.fin_first_dir is None:
+                    flow.fin_first_dir = direction_fwd
+                if direction_fwd:
+                    flow.fin_fwd = True
+                else:
+                    flow.fin_rev = True
+            elif (flow.closing and flow.fin_fwd and flow.fin_rev and not (tcp_flags & TCP_RST)
+                  and (tcp_flags & TCP_ACK) and direction_fwd == flow.fin_first_dir):
+                # FIN seen from both sides and the first closer sent the final ACK: teardown complete, export now
+                flow.close_reason = "fin_complete"
+                rec = self._export(flow)
+                del self._flows[key]
+                self._tombstone(key, now_wall)
+                return rec
         return None
 
     def _export(self, flow: _FlowRecord) -> Optional[dict]:
@@ -643,8 +805,8 @@ class FlowExtractor:
         # This does NOT fake the data — it corrects a systematic measurement gap
         # between Scapy raw capture and the NetFlow monitoring system that produced
         # the training dataset (NetFlow typically adds TCP option headers to counts).
-        _MIN_PKT_FLOOR_TCP = 52   # training benign minimum for established TCP flows
-        if flow.protocol == 6 and pkt_lens:  # TCP only
+        _MIN_PKT_FLOOR_TCP = self._tcp_floor   # default 52 = training benign minimum for established TCP flows
+        if flow.protocol == 6 and pkt_lens and _MIN_PKT_FLOOR_TCP:  # TCP only; floor disabled when 0
             shortest_model = max(shortest, _MIN_PKT_FLOOR_TCP)
         else:
             shortest_model = shortest
@@ -754,6 +916,9 @@ class FlowExtractor:
             "_duration"  : dur_s,
             "_pkt_rate"  : pkt_rate,
             "_timestamp" : flow.t_first,
+            # [proposal] diagnostics, never model inputs
+            "_close_reason": flow.close_reason,
+            "_midflow"   : bool(flow.protocol == 6 and not flow.saw_syn),
         }
 
         return features

@@ -51,7 +51,9 @@ tf.random.set_seed(42)
 
 # ── Paths ────────────────────────────────────────────────────────────────────
 DATASET_PATH = os.path.join(os.path.dirname(__file__), "NF-UNSW-NB15-v3.csv")
-MODELS_DIR   = os.path.join(os.path.dirname(__file__), "models")
+from config.paths import resolve_models_dir, guard_output_dir
+MODELS_DIR   = resolve_models_dir()
+guard_output_dir(MODELS_DIR, targets=["rf_model.pkl", "ae_model.keras", "scaler.pkl", "artifacts.json"])
 
 os.makedirs(MODELS_DIR, exist_ok=True)
 

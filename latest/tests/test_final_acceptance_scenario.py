@@ -25,6 +25,7 @@ from app import (
 )
 
 
+@pytest.mark.requires_models
 def test_final_acceptance_scenario():
     """Run the 6-step Final Acceptance Test Scenario."""
     init_engines()

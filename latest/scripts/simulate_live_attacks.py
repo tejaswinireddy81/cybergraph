@@ -16,12 +16,24 @@ Features:
   - Evaluates live response, XAI feature saliency, and active OS firewall blocking.
 """
 
+import os
+import sys
 import time
 import json
 import random
 import requests
 
-API_URL = "http://127.0.0.1:5000/api/stream_step"
+# Resolve repository root
+HERE = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.path.abspath(os.path.join(HERE, ".."))
+if ROOT not in sys.path:
+    sys.path.insert(0, ROOT)
+
+from config.secrets_manager import get_admin_token
+
+API_BASE = os.environ.get("CYBERGRAPH_URL", "http://127.0.0.1:5000")
+API_URL = f"{API_BASE}/api/stream_step"
+SET_MODE_URL = f"{API_BASE}/api/set_mode"
 
 
 def generate_attack_flow(attack_type="DoS"):
@@ -99,27 +111,34 @@ def run_simulation(num_steps=10, delay=1.0):
     print("==================================================")
     print("CYBERGRAPH LIVE ATTACK SIMULATION & STRESS TESTER")
     print("==================================================")
-    print(f"Target Command Center API: {API_URL}")
+    print(f"Target Command Center API: {API_BASE}")
     print(f"Simulating {num_steps} live traffic bursts...\n")
+
+    admin_token = get_admin_token()
+    headers = {
+        "X-Admin-Token": admin_token,
+        "Content-Type": "application/json",
+    }
 
     attack_types = ["Reconnaissance", "DoS", "Exploit", "Backdoor", "Fuzzer", "Benign"]
 
     for step in range(1, num_steps + 1):
         atype = random.choice(attack_types)
-        if atype == "Benign":
-            endpoint = f"{API_URL}?mode=normal"
-        else:
-            endpoint = f"{API_URL}?mode=attack"
+        target_mode = "normal" if atype == "Benign" else "attack"
 
         try:
-            resp = requests.get(endpoint, timeout=5)
+            # Switch pipeline operating mode via authorized API
+            mode_resp = requests.post(SET_MODE_URL, json={"mode": target_mode}, headers=headers, timeout=5)
+            # Fetch current evaluated state snapshot
+            resp = requests.get(API_URL, headers=headers, timeout=5)
             if resp.status_code == 200:
                 data = resp.json()
-                mrisk = data.get("max_risk", 0.0)
-                nflows = data.get("flows_processed", 0)
+                stats = data.get("stats", {})
+                mrisk = float(stats.get("peak_risk", stats.get("current_risk", 0.0)))
+                nflows = stats.get("total_flows", 0)
                 level = "CRITICAL THREAT" if mrisk >= 0.85 else ("SUSPICIOUS" if mrisk >= 0.50 else "NORMAL")
 
-                print(f"[{step:02d}/{num_steps:02d}] Sent {atype:<14} Burst | Processed: {nflows} flows | Risk: {mrisk:.4f} | Level: {level}")
+                print(f"[{step:02d}/{num_steps:02d}] Injected {atype:<14} -> Mode: {target_mode:<6} | Total Flows: {nflows:<4} | Peak Risk: {mrisk:.4f} | Status: {level}")
             else:
                 print(f"[{step:02d}/{num_steps:02d}] API Returned Status Code: {resp.status_code}")
         except Exception as e:
@@ -129,7 +148,7 @@ def run_simulation(num_steps=10, delay=1.0):
 
     print("\n==================================================")
     print("LIVE SIMULATION COMPLETED SUCCESSFULLY")
-    print("Check live dashboard at http://127.0.0.1:5000 to view active graph and alerts.")
+    print(f"Check live dashboard at {API_BASE} to view active graph and alerts.")
     print("==================================================")
 
 

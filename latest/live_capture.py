@@ -163,9 +163,19 @@ def _run_capture(scapy_iface, extractor: FlowExtractor, bpf_filter: Optional[str
         sniff_kwargs["filter"] = bpf_filter
 
     try:
-        # Loop with short timeout so _stop_event terminates immediately even on idle interfaces
+        # Loop with short timeout; auto-recover if interface drops or re-attaches
         while not _stop_event.is_set():
-            sniff(**sniff_kwargs)
+            try:
+                sniff(**sniff_kwargs)
+            except Exception as inner_exc:
+                with _status_lock:
+                    capture_status["errors"] += 1
+                    capture_status["last_error"] = str(inner_exc)
+                time.sleep(1.0)
+                if scapy_iface is not None:
+                    new_iface = _resolve_scapy_iface(str(scapy_iface))
+                    if new_iface:
+                        sniff_kwargs["iface"] = new_iface
     except Exception as exc:
         with _status_lock:
             capture_status["errors"] += 1

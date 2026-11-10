@@ -101,7 +101,7 @@ class BARIEngine:
             port = int(row.get(port_col, 0))
             proto = int(row.get(proto_col, 6))
             s_key = _service_key(port, proto)
-            src = str(row.get(src_col, "0.0.0.0"))
+            src = str(row.get(src_col, "0.0.0.0"))  # nosec B104 - placeholder default for a missing column, not a socket bind
 
             counts[s_key] += 1
             total += 1

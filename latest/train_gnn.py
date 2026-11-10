@@ -18,6 +18,7 @@ import warnings
 import numpy as np
 import pandas as pd
 import torch
+from config.paths import resolve_models_dir, guard_output_dir, is_production_dir
 import torch.nn.functional as F
 from torch.optim import Adam
 from sklearn.preprocessing import StandardScaler
@@ -190,7 +191,10 @@ def test_synthetic_coordinated_attack(model, scaler, feats, labels):
     }
 
 
-def main():
+def main(models_dir=None, overwrite_production=False):
+    models_dir = resolve_models_dir(models_dir)
+    guard_output_dir(models_dir, overwrite_production=overwrite_production,
+                     targets=["gat_model.pt", "graph_feature_scaler.pkl", "gat_artifacts.json"])
     print("Loading dataset for host-graph construction …")
     df = pd.read_csv(DATASET_PATH)
     print(f"Dataset: {df.shape}")
@@ -302,13 +306,13 @@ def main():
     final_model = GATModel(input_dim=x.shape[1], hidden_dim=32, output_dim=2)
     final_model.load_state_dict(best_model_state)
 
-    torch.save(final_model.state_dict(), os.path.join(MODELS_DIR, "gat_model.pt"))
-    joblib.dump(scaler, os.path.join(MODELS_DIR, "graph_feature_scaler.pkl"))
+    torch.save(final_model.state_dict(), os.path.join(models_dir, "gat_model.pt"))
+    joblib.dump(scaler, os.path.join(models_dir, "graph_feature_scaler.pkl"))
 
     # Test synthetic coordinated attack scenario
     synth_results = test_synthetic_coordinated_attack(final_model, scaler, feats, labels)
 
-    with open(os.path.join(MODELS_DIR, "gat_artifacts.json"), "w") as f:
+    with open(os.path.join(models_dir, "gat_artifacts.json"), "w") as f:
         json.dump({
             "input_dim": int(x.shape[1]),
             "hidden_dim": 32,
@@ -344,10 +348,19 @@ def main():
         f.write(f"Overall Confusion Matrix: {overall_cm}\n\n")
         f.write(f"Synthetic Coordinated Attack Detection Rate: {synth_results['detection_rate']*100:.1f}%\n")
 
-    print(f"\nSaved GAT model -> {MODELS_DIR}/gat_model.pt")
+    print(f"\nSaved GAT model -> {models_dir}/gat_model.pt")
     print(f"Saved 5-fold CV report -> {OUT_DIR}/gat_cv_report.json")
     return overall_auc
 
 
+def _cli(argv=None):
+    import argparse
+    ap = argparse.ArgumentParser(description="Train the host-graph GAT.")
+    ap.add_argument("--models-dir", default=None, help="output dir (default: $CYBERGRAPH_MODELS_DIR or models/)")
+    ap.add_argument("--overwrite-production", action="store_true")
+    a = ap.parse_args(argv)
+    main(models_dir=a.models_dir, overwrite_production=a.overwrite_production)
+
+
 if __name__ == "__main__":
-    main()
+    _cli()

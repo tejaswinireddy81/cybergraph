@@ -15,7 +15,7 @@ import os
 import json
 import hashlib
 import logging
-from typing import Any
+from typing import Any, Optional
 import joblib
 import torch
 
@@ -40,7 +40,13 @@ def compute_sha256(filepath: str) -> str:
     return h.hexdigest()
 
 
-def verify_model_integrity(filepath: str, manifest_path: str = MANIFEST_PATH) -> bool:
+def _adjacent_manifest(filepath: str) -> str:
+    """Manifest that sits next to the model file (production models/ -> models/model_manifest.json;
+    a candidate directory -> its own manifest). Never falls back to another directory's manifest."""
+    return os.path.join(os.path.dirname(os.path.abspath(filepath)), os.path.basename(MANIFEST_PATH))
+
+
+def verify_model_integrity(filepath: str, manifest_path: Optional[str] = None) -> bool:
     """Verify that a model file matches its trusted manifest SHA-256 digest.
     
     Fail-closed policy:
@@ -50,6 +56,9 @@ def verify_model_integrity(filepath: str, manifest_path: str = MANIFEST_PATH) ->
     4. In production (CYBERGRAPH_ENV=production or FLASK_ENV=production), fail-closed is strictly enforced
        and CYBERGRAPH_ALLOW_UNVERIFIED_MODELS is ignored.
     """
+    if manifest_path is None:
+        manifest_path = _adjacent_manifest(filepath)
+
     is_prod = (
         os.environ.get("CYBERGRAPH_ENV", "").lower() in ("prod", "production") or
         os.environ.get("FLASK_ENV", "").lower() == "production"
@@ -106,22 +115,29 @@ def verify_model_integrity(filepath: str, manifest_path: str = MANIFEST_PATH) ->
     return True
 
 
-def safe_load_joblib(filepath: str, manifest_path: str = MANIFEST_PATH) -> Any:
+def safe_load_joblib(filepath: str, manifest_path: Optional[str] = None) -> Any:
     """Cryptographically verify file integrity before calling joblib.load()."""
     verify_model_integrity(filepath, manifest_path=manifest_path)
     return joblib.load(filepath)
 
 
-def safe_load_torch(filepath: str, weights_only: bool = True, map_location: str = "cpu", manifest_path: str = MANIFEST_PATH) -> Any:
+def safe_load_torch(filepath: str, weights_only: bool = True, map_location: str = "cpu", manifest_path: Optional[str] = None) -> Any:
     """Cryptographically verify file integrity and enforce weights_only=True on torch.load()."""
     verify_model_integrity(filepath, manifest_path=manifest_path)
-    return torch.load(filepath, map_location=map_location, weights_only=weights_only)
+    if not weights_only:
+        # Only for artifacts that are not plain tensors (e.g. the temporal graph dataset). The
+        # SHA-256 manifest check above is what makes this acceptable; never use it on unverified files.
+        logger.warning("Loading %s with weights_only=False (integrity-verified pickle)", os.path.basename(filepath))
+    return torch.load(filepath, map_location=map_location, weights_only=weights_only)  # nosec B614 - manifest-verified, default is weights_only=True
 
 
-def regenerate_model_manifest(models_dir: str = MODELS_DIR, manifest_path: str = MANIFEST_PATH) -> dict:
+def regenerate_model_manifest(models_dir: str = MODELS_DIR, manifest_path: Optional[str] = None) -> dict:
     """Scan all model files, weights, and scalers in models_dir, compute SHA-256 and file sizes,
     and update model_manifest.json.
     """
+    if manifest_path is None:
+        # Written next to the models it describes, so a candidate run can never touch the production manifest.
+        manifest_path = os.path.join(models_dir, os.path.basename(MANIFEST_PATH))
     valid_exts = (".pkl", ".keras", ".pt", ".json", ".joblib")
     manifest = {}
     if os.path.exists(models_dir):

@@ -5,7 +5,7 @@ from modules.firewall_response_executor import FirewallResponseExecutor
 
 
 def _win_executor():
-    fw = FirewallResponseExecutor()
+    fw = FirewallResponseExecutor(mode="enforce")
     fw.os_type = "windows"
     return fw
 

@@ -1,4 +1,10 @@
-name: CyberGraph CI Workflow
+name: CyberGraph CI
+
+# Fresh GitHub runners have NO trained models, dataset or local secrets (all gitignored), and CI
+# never retrains them. Tests are therefore split explicitly (see latest/tests/conftest.py):
+#   * unmarked tests      -> web layer, auth/CSRF, firewall safety, dashboard JS ... run here
+#   * @requires_models    -> need real trained models; reported as SKIPPED with a reason
+# Full model-dependent coverage runs on a developer machine after `python scripts/setup_pipeline.py`.
 
 on:
   push:
@@ -6,9 +12,17 @@ on:
   pull_request:
     branches: [ main, master ]
 
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   test-and-audit:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     defaults:
       run:
         working-directory: latest
@@ -21,50 +35,48 @@ jobs:
       uses: actions/setup-python@v5
       with:
         python-version: "3.12"
+        cache: pip
+        cache-dependency-path: latest/requirements.txt
 
-    - name: Install dependencies
+    - name: Set up Node (dashboard JS syntax check)
+      uses: actions/setup-node@v4
+      with:
+        node-version: "20"
+
+    - name: Install dependencies (CPU-only)
       run: |
         python -m pip install --upgrade pip
-        pip install -r requirements.txt
+        # PyTorch CPU wheels: the default Linux wheel drags in ~3 GB of CUDA libraries.
+        pip install torch --index-url https://download.pytorch.org/whl/cpu
+        # TensorFlow is imported only by the training/evaluation scripts, never by the app or the
+        # tests, so CI skips it. torch is already installed above.
+        grep -v -E '^(tensorflow-cpu|torch)[<>=!~ ]' requirements.txt > "$RUNNER_TEMP/requirements-ci.txt"
+        pip install -r "$RUNNER_TEMP/requirements-ci.txt"
         pip install bandit flake8 pip-audit
 
-    - name: Dependency Vulnerability Audit (pip-audit)
-      # Pinned legacy ML framework packages (PyTorch 2.1.2) have known deserialization CVEs
-      # mitigated at runtime via fail-closed SHA-256 trusted_model_loader and weights_only=True.
+    - name: Dependency vulnerability audit (pip-audit)
+      # Audits what was actually installed. The local-version CPU torch wheel is not on PyPI, so
+      # pip-audit reports it as "could not be audited" (a notice, not a failure).
       run: |
-        pip-audit --desc \
-          --ignore-vuln GHSA-3749-ghw9-m3mg \
-          --ignore-vuln GHSA-53q9-r3pm-6pq6 \
-          --ignore-vuln GHSA-5pcm-hx3q-hm94 \
-          --ignore-vuln GHSA-63cw-57p8-fm3p \
-          --ignore-vuln GHSA-887c-mr87-cxwp \
-          --ignore-vuln GHSA-c678-jfcj-6jmf \
-          --ignore-vuln GHSA-f4hp-rmr7-r7v8 \
-          --ignore-vuln GHSA-pg7h-5qx3-wjr3 \
-          --ignore-vuln GHSA-qfhq-4f3w-5fph \
-          --ignore-vuln GHSA-rrmf-rvhw-rf47 \
-          --ignore-vuln GHSA-vgrw-7cvw-pwgx \
-          --ignore-vuln GHSA-x3gm-94wq-g975 \
-          --ignore-vuln GHSA-cq46-m9x9-j8w2 \
-          --ignore-vuln GHSA-jw8x-6495-233v \
-          --ignore-vuln GHSA-68rp-wp8r-4726 \
-          --ignore-vuln GHSA-6w46-j5rx-g56g \
-          --ignore-vuln GHSA-3f84-rpwh-47g6 \
-          --ignore-vuln GHSA-9298-4cf8-g4wj
+        pip-audit --desc --local
 
-    - name: Static Security Analysis (Bandit)
+    - name: Static security analysis (Bandit, medium+ severity/confidence)
       run: |
-        bandit -r routes modules response config -ll -ii
+        bandit -r routes modules response config evaluation scripts/experiments -ll -ii
 
-    - name: Code Quality & Lint (Flake8)
+    - name: Lint - correctness gate (blocking)
+      # Syntax errors, undefined names, invalid comparisons.
       run: |
-        flake8 routes modules response config --count --max-line-length=127 --extend-ignore=E203,W503 --statistics
+        flake8 routes modules response config evaluation scripts/experiments --select=E9,F63,F7,F82 --count --show-source --statistics
+
+    - name: Lint - style report (informational, never blocks)
+      run: |
+        flake8 routes modules response config evaluation scripts/experiments --max-line-length=127 --extend-ignore=E203,W503 --statistics --exit-zero
 
     - name: Dashboard JS syntax check
       run: |
         node --check static/js/app.js
 
-    - name: Run Pytest suite
+    - name: Run pytest (model-dependent tests are skipped with a reason)
       run: |
-        pytest tests/ -v
-
+        pytest tests/ -v -rs

@@ -21,6 +21,7 @@ import random
 import numpy as np
 import joblib
 import torch
+from config.paths import resolve_models_dir, guard_output_dir, is_production_dir
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.optim import Adam
@@ -58,17 +59,28 @@ def log(msg=""):
     print(msg, flush=True)
 
 
-def train_gnn():
+def train_gnn(models_dir=None, overwrite_production=False, dataset_path=None):
+    """Train the dynamic temporal GNN.
+
+    models_dir : where model files are written (default: $CYBERGRAPH_MODELS_DIR or production models/).
+    dataset_path : temporal graph dataset to READ (default: the production one; it is never modified).
+    """
+    models_dir = resolve_models_dir(models_dir)
+    guard_output_dir(models_dir, overwrite_production=overwrite_production,
+                     targets=["dynamic_temporal_gnn.pt", "gnn_scalers.pkl"])
+    dataset_path = dataset_path or TEMPORAL_DATASET_PATH
+    scalers_path = os.path.join(models_dir, "gnn_scalers.pkl")
+    gnn_model_path = os.path.join(models_dir, "dynamic_temporal_gnn.pt")
     log("==================================================")
     log("PHASE 5: TRAINING DYNAMIC BIPARTITE TEMPORAL GNN")
     log("==================================================")
 
-    if not os.path.exists(TEMPORAL_DATASET_PATH):
+    if not os.path.exists(dataset_path):
         raise FileNotFoundError(
-            f"Dataset missing at '{TEMPORAL_DATASET_PATH}'. Please run 'python build_temporal_pipeline.py' first."
+            f"Dataset missing at '{dataset_path}'. Please run 'python build_temporal_pipeline.py' first."
         )
 
-    storage = TemporalGraphStorage.load(TEMPORAL_DATASET_PATH)
+    storage = TemporalGraphStorage.load(dataset_path)
     num_snapshots = len(storage.snapshots)
     log(f"Loaded {num_snapshots} temporal graph snapshots.")
 
@@ -93,7 +105,7 @@ def train_gnn():
         "host_scaler": host_scaler,
         "service_scaler": service_scaler,
         "edge_scaler": edge_scaler,
-    }, SCALERS_PATH)
+    }, scalers_path)
 
     log("Fit and saved StandardScalers for node features and edge attributes.")
 
@@ -161,8 +173,8 @@ def train_gnn():
             log(f"  Epoch {epoch+1:2d}/{epochs:2d} - Sequence Loss: {avg_loss:.6f}")
 
     # Save trained weights
-    torch.save(model.state_dict(), GNN_MODEL_PATH)
-    log(f"\nTrained model weights saved to: {GNN_MODEL_PATH}")
+    torch.save(model.state_dict(), gnn_model_path)
+    log(f"\nTrained model weights saved to: {gnn_model_path}")
 
     # ============================================================
     # EVALUATION ON UNSEEN FUTURE TEMPORAL TEST SNAPSHOTS (G_6, G_7)
@@ -245,8 +257,22 @@ def train_gnn():
         json.dump(report, f, indent=2)
 
     log(f"\nReport saved to: {GNN_REPORT_PATH}")
+    if not is_production_dir(models_dir):
+        # candidate directories get their own manifest, written next to the models
+        from modules.trusted_model_loader import regenerate_model_manifest
+        regenerate_model_manifest(models_dir)
     return report
 
 
+def _main(argv=None):
+    import argparse
+    ap = argparse.ArgumentParser(description="Train the dynamic temporal GNN.")
+    ap.add_argument("--models-dir", default=None, help="output dir (default: $CYBERGRAPH_MODELS_DIR or models/)")
+    ap.add_argument("--overwrite-production", action="store_true")
+    ap.add_argument("--dataset-path", default=None, help="temporal graph dataset to read")
+    a = ap.parse_args(argv)
+    train_gnn(models_dir=a.models_dir, overwrite_production=a.overwrite_production, dataset_path=a.dataset_path)
+
+
 if __name__ == "__main__":
-    train_gnn()
+    _main()

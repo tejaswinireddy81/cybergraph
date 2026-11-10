@@ -42,6 +42,8 @@ from sklearn.metrics import (
 
 import xgboost as xgb
 
+from config.paths import resolve_models_dir, guard_output_dir, manifest_path_for
+
 warnings.filterwarnings("ignore")
 
 # --- Reproducibility ---
@@ -118,8 +120,35 @@ def load_dataset():
     return df
 
 
-def train_pipeline():
+def train_pipeline(models_dir=None, overwrite_production=False, max_rows=None, seed=42):
+    """Train XGBoost + autoencoder + fusion.
+
+    models_dir : output directory. Default (None) = CYBERGRAPH_MODELS_DIR or the production models/ dir.
+                 Candidate runs should use models_candidates/<run_id>/.
+    overwrite_production : needed to overwrite existing production models (a backup is taken first).
+    max_rows : evenly-spaced chronological subsample, for smoke tests only (default: use everything).
+    seed : random seed (default 42 = historical behaviour).
+    """
+    models_dir = resolve_models_dir(models_dir)
+    guard_info = guard_output_dir(
+        models_dir, overwrite_production=overwrite_production,
+        targets=["xgboost_model.json", "ae_model.pkl", "scaler.pkl", "fusion_model.pkl", "xgboost_ae_artifacts.json"],
+    )
+    if guard_info["backup"]:
+        print(f"[BACKUP] Existing production models copied to {guard_info['backup']}")
+    xgb_path = os.path.join(models_dir, "xgboost_model.json")
+    ae_path = os.path.join(models_dir, "ae_model.pkl")
+    scaler_path = os.path.join(models_dir, "scaler.pkl")
+    fusion_path = os.path.join(models_dir, "fusion_model.pkl")
+    artifacts_path = os.path.join(models_dir, "xgboost_ae_artifacts.json")
+    print(f"[OUTPUT] models will be written to: {models_dir}")
+    random.seed(seed)
+    np.random.seed(seed)
+
     df = load_dataset()
+    if max_rows is not None and max_rows < len(df):
+        df = df.iloc[np.linspace(0, len(df) - 1, int(max_rows)).astype(int)].reset_index(drop=True)
+        print(f"[SMOKE] using an evenly spaced subsample of {len(df)} rows")
 
     X = df[FEATURE_COLS].copy()
     for col in FEATURE_COLS:
@@ -149,7 +178,7 @@ def train_pipeline():
         learning_rate=0.1,
         subsample=0.8,
         colsample_bytree=0.8,
-        random_state=42,
+        random_state=seed,
         n_jobs=-1,
         eval_metric="logloss",
     )
@@ -192,7 +221,7 @@ def train_pipeline():
         activation="relu",
         solver="adam",
         max_iter=15,
-        random_state=42,
+        random_state=seed,
         early_stopping=True,
     )
     ae_model.fit(Xn_train_s, Xn_train_s)
@@ -251,10 +280,10 @@ def train_pipeline():
     # 4. SAVE ARTIFACTS
     # ============================================================
     print("\nSaving Phase 1 trained model artifacts ...")
-    xgb_model.save_model(XGB_PATH)
-    joblib.dump(ae_model, AE_PATH)
-    joblib.dump(scaler, SCALER_PATH)
-    joblib.dump(fusion_model, FUSION_PATH)
+    xgb_model.save_model(xgb_path)
+    joblib.dump(ae_model, ae_path)
+    joblib.dump(scaler, scaler_path)
+    joblib.dump(fusion_model, fusion_path)
 
     artifacts = {
         "feature_cols": FEATURE_COLS,
@@ -288,18 +317,33 @@ def train_pipeline():
         },
     }
 
-    with open(ARTIFACTS_PATH, "w") as f:
+    with open(artifacts_path, "w") as f:
         json.dump(artifacts, f, indent=2)
 
     try:
         from modules.trusted_model_loader import regenerate_model_manifest
-        regenerate_model_manifest(MODELS_DIR)
+        regenerate_model_manifest(models_dir, manifest_path=manifest_path_for(models_dir))
     except Exception as e:
         print(f"[WARN] Unable to regenerate manifest: {e}")
 
-    print(f"Phase 1 artifacts saved successfully to '{MODELS_DIR}'!")
+    print(f"Phase 1 artifacts saved successfully to '{models_dir}'!")
     return artifacts
 
 
+def _main(argv=None):
+    import argparse
+    ap = argparse.ArgumentParser(description="Train XGBoost + autoencoder + fusion (writes model files).")
+    ap.add_argument("--models-dir", default=None,
+                    help="output directory (default: $CYBERGRAPH_MODELS_DIR or production models/). "
+                         "Use models_candidates/<run_id> for candidate runs.")
+    ap.add_argument("--overwrite-production", action="store_true",
+                    help="allow replacing existing production models (a backup is taken first)")
+    ap.add_argument("--max-rows", type=int, default=None, help="evenly spaced subsample, smoke tests only")
+    ap.add_argument("--seed", type=int, default=42)
+    args = ap.parse_args(argv)
+    train_pipeline(models_dir=args.models_dir, overwrite_production=args.overwrite_production,
+                   max_rows=args.max_rows, seed=args.seed)
+
+
 if __name__ == "__main__":
-    train_pipeline()
+    _main()

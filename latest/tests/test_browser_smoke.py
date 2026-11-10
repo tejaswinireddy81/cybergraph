@@ -75,12 +75,14 @@ def server():
     try:
         for _ in range(120):
             try:
-                urllib.request.urlopen(url + "/api/stream_step", timeout=2)
-                break
+                with urllib.request.urlopen(url + "/api/stream_step", timeout=2) as resp:
+                    data = json.load(resp)
+                    if data.get("stats", {}).get("total_flows", 0) > 0:
+                        break
             except Exception:
                 if proc.poll() is not None:
                     pytest.skip("app exited during startup")
-                time.sleep(1)
+            time.sleep(1)
         else:
             pytest.skip("app did not start in time")
         yield url
@@ -162,6 +164,13 @@ async def _run_browser(url):
             result["ls_token"] = await ev("String(localStorage.getItem('cybergraph_admin_token'))")
             result["js_cookie"] = await ev("document.cookie")
             result["post_status"] = await ev("postAdmin('/api/unblock_ip',{ip:'192.0.2.250'}).then(r=>r.status)")
+            await wait(1)
+            result["fw_badge"] = await ev("document.getElementById('btn-fw-mode').innerText")
+            result["dry_block"] = await ev(
+                "postAdmin('/api/execute_real_block',{ip:'203.0.113.99',confirm:true}).then(r=>r.json()).then(j=>j.status+'|'+j.dry_run)")
+            result["modal_note"] = await ev(
+                "(()=>{executeRealBlock('203.0.113.98');return document.getElementById('fw-confirm-mode-note').innerText})()")
+            await ev("closeFirewallModal()")
             await ev("document.getElementById('btn-open-block-history').click()")
             await wait(2)
             result["history_open"] = await ev(
@@ -186,4 +195,7 @@ def test_dashboard_in_real_browser(server):
     assert r["ls_token"] == "null", "admin token must not be kept in localStorage"
     assert "cybergraph_session" not in r["js_cookie"], "session cookie must be HttpOnly"
     assert r["post_status"] == 200
+    assert "DRY-RUN" in r["fw_badge"]
+    assert r["dry_block"] == "SIMULATED_BLOCK_RECORDED|true"
+    assert "no OS firewall command" in r["modal_note"]
     assert r["history_open"] == "flex"

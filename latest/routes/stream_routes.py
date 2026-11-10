@@ -19,6 +19,9 @@ stream_bp = Blueprint("stream_bp", __name__)
 
 
 def _get_app_context():
+    import sys
+    if "__main__" in sys.modules and hasattr(sys.modules["__main__"], "mitre_mapper"):
+        return sys.modules["__main__"]
     import app as main_app
     return main_app
 
@@ -37,14 +40,12 @@ def stream_step():
 
 @stream_bp.route("/api/stream_events", methods=["GET"])
 def stream_events():
-    """Returns recent evaluation threat events (Viewer Access Protected)."""
+    """Server-Sent Events (SSE) stream providing real-time push updates (Viewer Access Protected)."""
     main_app = _get_app_context()
     main_app.init_engines()
-    if not verify_read_viewer_access(lambda tok: tok in main_app._authorized_monitored_devices):
-        return jsonify({"status": "ERROR", "message": "Unauthorized: Viewer access required"}), 401
-    with main_app.state_lock:
-        events = list(main_app._recent_event_history)
-    return jsonify({"events": events, "count": len(events)})
+    if hasattr(main_app, "_stream_events_impl"):
+        return main_app._stream_events_impl()
+    return main_app.stream_events()
 
 
 @stream_bp.route("/api/pipeline_diag", methods=["GET"])

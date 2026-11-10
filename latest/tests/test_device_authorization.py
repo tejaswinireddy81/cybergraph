@@ -129,6 +129,7 @@ def test_e_pending_device_is_not_authorized_host():
     assert client_ip not in auth_ips
 
 
+@pytest.mark.requires_models
 def test_f_pending_device_graph_node_rendered_as_pending_suspicious():
     """Requirement F: Pending device is visually/classified as SUSPICIOUS/PENDING."""
     client_ip = "10.160.36.186"

@@ -17,7 +17,15 @@ logger = logging.getLogger(__name__)
 admin_bp = Blueprint("admin_bp", __name__)
 
 
+def _actor():
+    """Identify the requester in audit records (remote address + admin session marker)."""
+    return f"admin@{request.remote_addr or 'unknown'}"
+
+
 def _get_app_context():
+    import sys
+    if "__main__" in sys.modules and hasattr(sys.modules["__main__"], "fw_executor"):
+        return sys.modules["__main__"]
     import app as main_app
     return main_app
 
@@ -50,7 +58,18 @@ def execute_real_block():
     if not clean_ip:
         return jsonify({"status": "ERROR", "message": f"Invalid IP address: '{target_ip}'"}), 400
 
-    res = main_app.fw_executor.execute_block(clean_ip, force_real=True)
+    body = request.get_json(silent=True) if request.is_json else None
+    confirmed = bool((body or {}).get("confirm")) or request.args.get("confirm") in ("1", "true", "yes")
+    fw = main_app.fw_executor
+    if fw.is_enforcing and not confirmed:
+        # Server-side guard: the UI shows a confirmation dialog and then sends confirm=true.
+        return jsonify({
+            "status": "CONFIRMATION_REQUIRED",
+            "mode": fw.mode,
+            "message": "Real OS blocking requires explicit confirmation (confirm=true).",
+        }), 428
+
+    res = fw.execute_block(clean_ip, allow_real=True, actor=_actor())
     if res.get("status") in ["REAL_FIREWALL_RULE_APPLIED", "REAL_FIREWALL_RULE_ELEVATED"] or res.get("execution_mode") in ["REAL_OS_FIREWALL", "REAL_OS_FIREWALL_ELEVATED"]:
         with main_app.state_lock:
             main_app.shared_state["stats"]["real_os_rules_applied"] += 1
@@ -86,7 +105,7 @@ def api_unblock_ip():
     if not clean_ip:
         return jsonify({"status": "ERROR", "message": f"Invalid IP address: '{target_ip}'"}), 400
 
-    res = main_app.fw_executor.execute_unblock(clean_ip)
+    res = main_app.fw_executor.execute_unblock(clean_ip, actor=_actor())
     return jsonify(res)
 
 
@@ -129,3 +148,47 @@ def api_blocks_history():
         "history": fw_history[-50:]
     })
 
+
+
+@admin_bp.route("/api/firewall/mode", methods=["GET"])
+def api_firewall_mode_get():
+    main_app = _get_app_context()
+    main_app.init_engines()
+    if not verify_read_viewer_access(lambda tok: tok in main_app._authorized_monitored_devices):
+        return jsonify({"status": "ERROR", "message": "Viewer access required"}), 401
+    fw = main_app.fw_executor
+    return jsonify({
+        "status": "SUCCESS",
+        "mode": fw.mode,
+        "enforcing": fw.is_enforcing,
+        "active_real_rules": sorted(fw.active_os_firewall_rules),
+    })
+
+
+@admin_bp.route("/api/firewall/mode", methods=["POST"])
+def api_firewall_mode_set():
+    """Switch dry-run <-> enforce. Enforce additionally needs confirm == "ENFORCE"."""
+    main_app = _get_app_context()
+    main_app.init_engines()
+
+    csrf_ok, csrf_err = verify_csrf_protection()
+    if not csrf_ok:
+        return jsonify({"status": "ERROR", "message": f"Forbidden: {csrf_err}"}), 403
+    if not verify_admin_request():
+        logger.warning(f"[SECURITY 403] Unauthorized firewall mode change from {request.remote_addr}")
+        return jsonify({"status": "ERROR", "message": "Forbidden: Administrative access required"}), 403
+
+    data = request.get_json(silent=True) or {}
+    mode = str(data.get("mode", "")).strip().lower()
+    if mode not in ("dry-run", "enforce"):
+        return jsonify({"status": "ERROR", "message": "mode must be 'dry-run' or 'enforce'"}), 400
+    if mode == "enforce" and data.get("confirm") != "ENFORCE":
+        return jsonify({
+            "status": "CONFIRMATION_REQUIRED",
+            "message": "Enabling enforce mode requires confirm='ENFORCE'.",
+        }), 428
+    try:
+        res = main_app.fw_executor.set_mode(mode, actor=_actor())
+    except ValueError as exc:
+        return jsonify({"status": "ERROR", "message": str(exc)}), 409
+    return jsonify({"status": "SUCCESS", **res})

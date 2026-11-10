@@ -267,6 +267,7 @@
             <button class="cyber-btn" id="btn-open-block-history" style="background:rgba(255, 0, 85, 0.2); border:1px solid var(--critical-crimson); color:var(--critical-crimson); font-size:10px; padding:6px 10px; margin:0; width:auto;" aria-label="Open Firewall Block History">🛡️ FIREWALL BLOCKS</button>
             <button class="cyber-btn" id="btn-admin-auth" style="background:rgba(124, 58, 237, 0.2); border:1px solid var(--electric-purple); color:var(--electric-purple); font-size:10px; padding:6px 10px; margin:0; width:auto;" aria-label="Admin Authentication">🔑 ADMIN AUTH</button>
             <button class="cyber-btn export-btn" id="btn-export-report" aria-label="Export Audit Report">Export Audit Report</button>
+            <button class="cyber-btn" id="btn-fw-mode" style="background:rgba(16,185,129,0.15); border:1px solid var(--emerald-green); color:var(--emerald-green); font-size:10px; padding:6px 10px; margin:0; width:auto;" aria-label="Firewall mode (click to change)" title="Firewall mode: dry-run never touches the OS firewall">&#128274; FIREWALL: DRY-RUN</button>
             <button class="cyber-btn" id="btn-theme-toggle" style="background:rgba(255,255,255,0.08); border:1px solid var(--panel-border); color:var(--text-main); font-size:10px; padding:6px 10px; margin:0; width:auto;" aria-label="Toggle Theme">🌓 THEME</button>
         </div>
     </header>
@@ -509,7 +510,8 @@
                 <span class="drawer-close" id="btn-close-fw-modal" role="button" tabindex="0" aria-label="Close Modal">✕</span>
             </div>
             <div class="modal-body">
-                <p style="margin-bottom:10px; color:var(--text-main);">You are about to enforce a direct packet-level drop rule at the operating system kernel/firewall.</p>
+                <p id="fw-confirm-lead" style="margin-bottom:10px; color:var(--text-main);">You are about to enforce a direct packet-level drop rule at the operating system kernel/firewall.</p>
+                <div id="fw-confirm-mode-note" style="margin-bottom:10px; padding:8px; border-radius:6px; font-weight:700; font-size:11px;"></div>
                 <div style="background:rgba(0,0,0,0.5); padding:10px; border-radius:6px; border:1px solid var(--panel-border); margin-bottom:12px;">
                     <div><strong>Target IP:</strong> <span id="fw-confirm-ip" style="color:var(--critical-crimson); font-size:13px;"></span></div>
                     <div style="margin-top:4px;"><strong>Command:</strong> <div id="fw-confirm-cmd" class="cmd-box"></div></div>
